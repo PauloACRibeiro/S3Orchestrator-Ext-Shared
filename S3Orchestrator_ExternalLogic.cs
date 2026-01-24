@@ -269,13 +269,36 @@ namespace S3Orchestrator_ExternalLogic
 
         using var s3 = CreateClient(authInfo);
         var response = s3.ListBucketsAsync().GetAwaiter().GetResult();
-        var bucketNames = response.Buckets?
-          .Where(bucket => !string.IsNullOrWhiteSpace(bucket.BucketName))
-          .Select(bucket => bucket.BucketName!)
-          .ToArray() ?? Array.Empty<string>();
+        var targetRegion = authInfo.Region.Trim();
+        var bucketNames = new List<string>();
 
-        _logger.LogInformation("Listed {Count} buckets for provided credentials.", bucketNames.Length);
-        return bucketNames;
+        if (response.Buckets != null)
+        {
+          foreach (var bucket in response.Buckets)
+          {
+            if (string.IsNullOrWhiteSpace(bucket.BucketName)) continue;
+            var bucketName = bucket.BucketName;
+            try
+            {
+              var locationResponse = s3.GetBucketLocationAsync(new GetBucketLocationRequest
+              {
+                BucketName = bucketName
+              }).GetAwaiter().GetResult();
+
+              var location = NormalizeBucketRegion(locationResponse.Location);
+              if (!string.Equals(location, targetRegion, StringComparison.OrdinalIgnoreCase)) continue;
+
+              bucketNames.Add(bucketName);
+            }
+            catch (Exception ex)
+            {
+              _logger.LogWarning(ex, "Failed to resolve region for bucket {Bucket}; skipping.", bucketName);
+            }
+          }
+        }
+
+        _logger.LogInformation("Listed {Count} buckets for provided credentials in region {Region}.", bucketNames.Count, targetRegion);
+        return bucketNames.ToArray();
       }
       catch (Exception ex)
       {
@@ -1048,6 +1071,13 @@ namespace S3Orchestrator_ExternalLogic
       };
 
       return new AmazonS3Client(auth.AccessKeyId, auth.SecretAccessKey, cfg);
+    }
+
+    private static string NormalizeBucketRegion(S3Region location)
+    {
+      if (location == S3Region.USEast1) return "us-east-1";
+      var raw = location?.Value;
+      return string.IsNullOrWhiteSpace(raw) ? "us-east-1" : raw;
     }
 
     private static string SafeHost(string url)
