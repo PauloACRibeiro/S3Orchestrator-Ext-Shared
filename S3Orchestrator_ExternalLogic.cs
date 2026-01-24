@@ -101,6 +101,10 @@ namespace S3Orchestrator_ExternalLogic
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName);
 
+    [OSAction(Description = "List S3 buckets available for the credentials")]
+    string[] ListBuckets(
+      [OSParameter(Description = "Auth info")] S3AuthInfo authInfo);
+
     // Existing: single GET (ODC) -> single PUT (S3). Suitable while source responses stay under the platform cap.
     [OSAction(Description = "Upload to S3 using a pre-signed single-part PUT by streaming a binary from an ODC REST Source URL")]
     string UploadFromRestToPresignedUrl(
@@ -250,6 +254,32 @@ namespace S3Orchestrator_ExternalLogic
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to list contents of bucket {Bucket}", bucketName);
+        throw;
+      }
+    }
+
+    public string[] ListBuckets(S3AuthInfo authInfo)
+    {
+      try
+      {
+        _logger.LogInformation("Listing S3 buckets for provided credentials.");
+        if (string.IsNullOrWhiteSpace(authInfo.AccessKeyId)) throw new ArgumentException("AccessKeyId is required.");
+        if (string.IsNullOrWhiteSpace(authInfo.SecretAccessKey)) throw new ArgumentException("SecretAccessKey is required.");
+        if (string.IsNullOrWhiteSpace(authInfo.Region)) throw new ArgumentException("Region is required.");
+
+        using var s3 = CreateClient(authInfo);
+        var response = s3.ListBucketsAsync().GetAwaiter().GetResult();
+        var bucketNames = response.Buckets?
+          .Where(bucket => !string.IsNullOrWhiteSpace(bucket.BucketName))
+          .Select(bucket => bucket.BucketName!)
+          .ToArray() ?? Array.Empty<string>();
+
+        _logger.LogInformation("Listed {Count} buckets for provided credentials.", bucketNames.Length);
+        return bucketNames;
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed to list buckets for provided credentials.");
         throw;
       }
     }
