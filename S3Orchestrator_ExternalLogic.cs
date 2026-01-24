@@ -104,6 +104,20 @@ namespace S3Orchestrator_ExternalLogic
     [OSAction(Description = "List S3 buckets available for the credentials")]
     string[] ListBuckets(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo);
+    [OSAction(Description = "Get the region for an S3 bucket")]
+    string GetBucketLocation(
+      [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
+      [OSParameter(Description = "Bucket name")] string bucketName);
+
+    [OSAction(Description = "Create an S3 bucket")]
+    bool CreateBucket(
+      [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
+      [OSParameter(Description = "Bucket name")] string bucketName);
+
+    [OSAction(Description = "Delete an S3 bucket (must be empty)")]
+    bool DeleteBucket(
+      [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
+      [OSParameter(Description = "Bucket name")] string bucketName);
 
     // Existing: single GET (ODC) -> single PUT (S3). Suitable while source responses stay under the platform cap.
     [OSAction(Description = "Upload to S3 using a pre-signed single-part PUT by streaming a binary from an ODC REST Source URL")]
@@ -303,6 +317,94 @@ namespace S3Orchestrator_ExternalLogic
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to list buckets for provided credentials.");
+    public string GetBucketLocation(S3AuthInfo authInfo, string bucketName)
+    {
+      try
+      {
+        _logger.LogInformation("Getting location for bucket {Bucket}", bucketName);
+        if (string.IsNullOrWhiteSpace(authInfo.AccessKeyId)) throw new ArgumentException("AccessKeyId is required.");
+        if (string.IsNullOrWhiteSpace(authInfo.SecretAccessKey)) throw new ArgumentException("SecretAccessKey is required.");
+        if (string.IsNullOrWhiteSpace(authInfo.Region)) throw new ArgumentException("Region is required.");
+        if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
+
+        using var s3 = CreateClient(authInfo);
+        var response = s3.GetBucketLocationAsync(new GetBucketLocationRequest
+        {
+          BucketName = bucketName
+        }).GetAwaiter().GetResult();
+
+        var region = response.Location?.Value;
+        if (string.IsNullOrWhiteSpace(region))
+        {
+          region = "us-east-1";
+        }
+
+        _logger.LogInformation("Retrieved location {Region} for bucket {Bucket}", region, bucketName);
+        return region;
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed to get location for bucket {Bucket}", bucketName);
+        throw;
+      }
+    }
+
+    public bool CreateBucket(S3AuthInfo authInfo, string bucketName)
+    {
+      try
+      {
+        _logger.LogInformation("Creating bucket {Bucket}", bucketName);
+        if (string.IsNullOrWhiteSpace(authInfo.AccessKeyId)) throw new ArgumentException("AccessKeyId is required.");
+        if (string.IsNullOrWhiteSpace(authInfo.SecretAccessKey)) throw new ArgumentException("SecretAccessKey is required.");
+        if (string.IsNullOrWhiteSpace(authInfo.Region)) throw new ArgumentException("Region is required.");
+        if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
+
+        using var s3 = CreateClient(authInfo);
+        var request = new PutBucketRequest
+        {
+          BucketName = bucketName,
+          BucketRegion = S3Region.FindValue(authInfo.Region)
+        };
+
+        s3.PutBucketAsync(request).GetAwaiter().GetResult();
+        _logger.LogInformation("Created bucket {Bucket}", bucketName);
+        return true;
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed to create bucket {Bucket}", bucketName);
+        throw;
+      }
+    }
+
+    public bool DeleteBucket(S3AuthInfo authInfo, string bucketName)
+    {
+      try
+      {
+        _logger.LogInformation("Deleting bucket {Bucket}", bucketName);
+        if (string.IsNullOrWhiteSpace(authInfo.AccessKeyId)) throw new ArgumentException("AccessKeyId is required.");
+        if (string.IsNullOrWhiteSpace(authInfo.SecretAccessKey)) throw new ArgumentException("SecretAccessKey is required.");
+        if (string.IsNullOrWhiteSpace(authInfo.Region)) throw new ArgumentException("Region is required.");
+        if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
+
+        using var s3 = CreateClient(authInfo);
+        var request = new DeleteBucketRequest
+        {
+          BucketName = bucketName
+        };
+
+        s3.DeleteBucketAsync(request).GetAwaiter().GetResult();
+        _logger.LogInformation("Deleted bucket {Bucket}", bucketName);
+        return true;
+      }
+      catch (AmazonS3Exception ex) when (string.Equals(ex.ErrorCode, "BucketNotEmpty", StringComparison.OrdinalIgnoreCase))
+      {
+        _logger.LogError(ex, "Failed to delete bucket {Bucket} because it is not empty.", bucketName);
+        throw new InvalidOperationException("Bucket must be empty before deletion.", ex);
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed to delete bucket {Bucket}", bucketName);
         throw;
       }
     }
