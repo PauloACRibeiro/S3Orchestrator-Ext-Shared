@@ -10,13 +10,14 @@ using Amazon.S3;
 using Amazon.S3.Model;
 
 //
-// -------- Version 1.0.8  --------
+// -------- Version 1.0.9  --------
 // Added a BucketObjectInfo OS structure to carry S3Key, FileSize, and CreatedAt (uses S3’s last-modified timestamp normalized to UTC) 
 // Exposed a new OS action GetBucketContents on IPreSigner that accepts auth info and bucket name, returning the bucket contents as an array of BucketObjectInfo 
 // Added a new OS action RenameObject on IPreSigner that accepts auth info, bucket name, current object key, and new object key
 // Added a new OS action DeleteFile on IPreSigner that accepts auth info, bucket name, and object key
 // Added a new OS action MoveFile on IPreSigner that accepts auth info, bucket name, source object key, and target directory
 // Added a new OS action RenameFile on IPreSigner that accepts auth info, bucket name, current object key, and new object key
+// Fixed ListBuckets method structure (missing throw/brace) so the project builds successfully
 
 namespace S3Orchestrator_ExternalLogic
 {
@@ -317,6 +318,10 @@ namespace S3Orchestrator_ExternalLogic
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to list buckets for provided credentials.");
+        throw;
+      }
+    }
+
     public string GetBucketLocation(S3AuthInfo authInfo, string bucketName)
     {
       try
