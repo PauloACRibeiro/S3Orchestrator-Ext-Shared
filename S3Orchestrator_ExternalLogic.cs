@@ -101,6 +101,11 @@ namespace S3Orchestrator_ExternalLogic
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName);
 
+    [OSAction(Description = "Get the region for an S3 bucket")]
+    string GetBucketLocation(
+      [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
+      [OSParameter(Description = "Bucket name")] string bucketName);
+
     [OSAction(Description = "Create an S3 bucket")]
     bool CreateBucket(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
@@ -260,6 +265,38 @@ namespace S3Orchestrator_ExternalLogic
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to list contents of bucket {Bucket}", bucketName);
+        throw;
+      }
+    }
+
+    public string GetBucketLocation(S3AuthInfo authInfo, string bucketName)
+    {
+      try
+      {
+        _logger.LogInformation("Getting location for bucket {Bucket}", bucketName);
+        if (string.IsNullOrWhiteSpace(authInfo.AccessKeyId)) throw new ArgumentException("AccessKeyId is required.");
+        if (string.IsNullOrWhiteSpace(authInfo.SecretAccessKey)) throw new ArgumentException("SecretAccessKey is required.");
+        if (string.IsNullOrWhiteSpace(authInfo.Region)) throw new ArgumentException("Region is required.");
+        if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
+
+        using var s3 = CreateClient(authInfo);
+        var response = s3.GetBucketLocationAsync(new GetBucketLocationRequest
+        {
+          BucketName = bucketName
+        }).GetAwaiter().GetResult();
+
+        var region = response.Location?.Value;
+        if (string.IsNullOrWhiteSpace(region))
+        {
+          region = "us-east-1";
+        }
+
+        _logger.LogInformation("Retrieved location {Region} for bucket {Bucket}", region, bucketName);
+        return region;
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed to get location for bucket {Bucket}", bucketName);
         throw;
       }
     }
