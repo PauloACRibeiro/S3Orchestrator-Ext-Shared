@@ -1,6 +1,7 @@
 ﻿using System.Buffers;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Collections.Concurrent;
 using System.Text.Json;
 using OutSystems.ExternalLibraries.SDK;
 using Microsoft.Extensions.Logging;
@@ -10,11 +11,13 @@ using Amazon.S3;
 using Amazon.S3.Model;
 
 //
-// -------- Version 1.0.11  --------
-// Added ListObjects action with prefix filtering and pagination (returns ListObjectsResult)
-// Removed GetBucketContents action (no consumers yet) in favor of ListObjects
-// Added ListObjectsResult OS structure to carry items and pagination token
-// Added GetObjectMetadata action returning ObjectMetadataInfo
+// -------- Version 1.0.12  --------
+// CreateBucket omits location constraint for us-east-1 (classic) to avoid InvalidLocationConstraint
+// Normalize bucket location values (EU/US -> canonical) and return normalized values from GetBucketLocation
+// Presigned PUT spools unknown-length streams to a temp file (bounded memory)
+// Shared HttpClient/handler to reduce socket churn and DNS overhead
+// Multipart upload retries transient GET/UploadPart failures with backoff
+// Sync helper uses ConfigureAwait(false) to reduce deadlock risk
 
 namespace S3Orchestrator_ExternalLogic
 {
@@ -225,6 +228,27 @@ namespace S3Orchestrator_ExternalLogic
   // -------- Implementation --------
   public class PreSignerImpl : IPreSigner
   {
+    private static readonly SocketsHttpHandler SharedHttpHandler = new SocketsHttpHandler
+    {
+      AllowAutoRedirect = true,
+      AutomaticDecompression = DecompressionMethods.None,
+      PooledConnectionLifetime = TimeSpan.FromMinutes(5)
+    };
+
+    private static readonly ConcurrentDictionary<int, HttpClient> HttpClients = new ConcurrentDictionary<int, HttpClient>();
+
+    private static HttpClient GetHttpClient(int timeoutSeconds)
+    {
+      if (timeoutSeconds <= 0) timeoutSeconds = 120;
+      return HttpClients.GetOrAdd(timeoutSeconds, seconds =>
+      {
+        return new HttpClient(SharedHttpHandler, disposeHandler: false)
+        {
+          Timeout = TimeSpan.FromSeconds(seconds)
+        };
+      });
+    }
+
     private readonly ILogger _logger;
 
     public PreSignerImpl() : this(NullLogger<PreSignerImpl>.Instance) { }
@@ -277,7 +301,7 @@ namespace S3Orchestrator_ExternalLogic
           ContinuationToken = string.IsNullOrWhiteSpace(continuationToken) ? null : continuationToken
         };
 
-        var response = s3.ListObjectsV2Async(request).GetAwaiter().GetResult();
+        var response = Sync(s3.ListObjectsV2Async(request));
         var items = new List<BucketObjectInfo>();
         if (response.S3Objects != null)
         {
@@ -323,11 +347,11 @@ namespace S3Orchestrator_ExternalLogic
         ValidateS3Key(key);
 
         using var s3 = CreateClient(authInfo);
-        var response = s3.GetObjectMetadataAsync(new GetObjectMetadataRequest
+        var response = Sync(s3.GetObjectMetadataAsync(new GetObjectMetadataRequest
         {
           BucketName = bucketName,
           Key = key
-        }).GetAwaiter().GetResult();
+        }));
 
         var etag = response.ETag ?? string.Empty;
         if (!string.IsNullOrEmpty(etag)) etag = etag.Trim('"');
@@ -365,7 +389,7 @@ namespace S3Orchestrator_ExternalLogic
         if (string.IsNullOrWhiteSpace(authInfo.Region)) throw new ArgumentException("Region is required.");
 
         using var s3 = CreateClient(authInfo);
-        var response = s3.ListBucketsAsync().GetAwaiter().GetResult();
+        var response = Sync(s3.ListBucketsAsync());
         var targetRegion = authInfo.Region.Trim();
         var bucketNames = new List<string>();
 
@@ -377,10 +401,10 @@ namespace S3Orchestrator_ExternalLogic
             var bucketName = bucket.BucketName;
             try
             {
-              var locationResponse = s3.GetBucketLocationAsync(new GetBucketLocationRequest
+              var locationResponse = Sync(s3.GetBucketLocationAsync(new GetBucketLocationRequest
               {
                 BucketName = bucketName
-              }).GetAwaiter().GetResult();
+              }));
 
               var location = NormalizeBucketRegion(locationResponse.Location);
               if (!string.Equals(location, targetRegion, StringComparison.OrdinalIgnoreCase)) continue;
@@ -415,17 +439,12 @@ namespace S3Orchestrator_ExternalLogic
         if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
 
         using var s3 = CreateClient(authInfo);
-        var response = s3.GetBucketLocationAsync(new GetBucketLocationRequest
+        var response = Sync(s3.GetBucketLocationAsync(new GetBucketLocationRequest
         {
           BucketName = bucketName
-        }).GetAwaiter().GetResult();
+        }));
 
-        var region = response.Location?.Value;
-        if (string.IsNullOrWhiteSpace(region))
-        {
-          region = "us-east-1";
-        }
-
+        var region = NormalizeBucketRegion(response.Location);
         _logger.LogInformation("Retrieved location {Region} for bucket {Bucket}", region, bucketName);
         return region;
       }
@@ -447,13 +466,24 @@ namespace S3Orchestrator_ExternalLogic
         if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
 
         using var s3 = CreateClient(authInfo);
+        var bucketRegion = S3Region.FindValue(authInfo.Region);
+        var isUsEast1 = string.Equals(bucketRegion?.Value, S3Region.USEast1.Value, StringComparison.OrdinalIgnoreCase)
+          || string.Equals(authInfo.Region, "us-east-1", StringComparison.OrdinalIgnoreCase);
         var request = new PutBucketRequest
         {
-          BucketName = bucketName,
-          BucketRegion = S3Region.FindValue(authInfo.Region)
+          BucketName = bucketName
         };
 
-        s3.PutBucketAsync(request).GetAwaiter().GetResult();
+        if (!isUsEast1)
+        {
+          request.BucketRegion = bucketRegion;
+        }
+        else
+        {
+          _logger.LogInformation("Skipping location constraint for us-east-1 when creating bucket {Bucket}", bucketName);
+        }
+
+        Sync(s3.PutBucketAsync(request));
         _logger.LogInformation("Created bucket {Bucket}", bucketName);
         return true;
       }
@@ -480,7 +510,7 @@ namespace S3Orchestrator_ExternalLogic
           BucketName = bucketName
         };
 
-        s3.DeleteBucketAsync(request).GetAwaiter().GetResult();
+        Sync(s3.DeleteBucketAsync(request));
         _logger.LogInformation("Deleted bucket {Bucket}", bucketName);
         return true;
       }
@@ -541,9 +571,7 @@ namespace S3Orchestrator_ExternalLogic
 
         _logger.LogInformation("Uploading from REST source host {SourceHost} to pre-signed S3 host {TargetHost}", SafeHost(sourceUrl), SafeHost(presignedPutUrl));
 
-        using var http = new HttpClient(
-          new HttpClientHandler { AllowAutoRedirect = true, AutomaticDecompression = DecompressionMethods.None })
-        { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+        var http = GetHttpClient(timeoutSeconds);
 
         var totalLength = TryProbeLength(http, sourceUrl, binGuid, authHeaderName, authHeaderValue);
 
@@ -570,6 +598,8 @@ namespace S3Orchestrator_ExternalLogic
 
         HttpContent putContent;
         var effectiveLength = upstreamLength ?? totalLength;
+        string? tempFilePath = null;
+        FileStream? tempFileStream = null;
 
         if (effectiveLength.HasValue)
         {
@@ -578,13 +608,14 @@ namespace S3Orchestrator_ExternalLogic
         }
         else
         {
-          // When Content-Length is missing, we must buffer to set Content-Length (presigned PUT does NOT accept unsigned chunked encoding)
-          var buffered = new MemoryStream();
-          srcStream.CopyTo(buffered);
-          buffered.Position = 0;
+          // When Content-Length is missing, buffer to a temp file to avoid unbounded memory usage.
+          _logger.LogInformation("Buffering source stream to temporary file to determine Content-Length.");
+          tempFilePath = Path.Combine(Path.GetTempPath(), $"s3orch-presign-{Guid.NewGuid():N}.bin");
+          var bufferedLength = BufferToTempFile(srcStream, tempFilePath);
           srcStream.Dispose();
-          putContent = new StreamContent(buffered);
-          putContent.Headers.ContentLength = buffered.Length;
+          tempFileStream = new FileStream(tempFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+          putContent = new StreamContent(tempFileStream);
+          putContent.Headers.ContentLength = bufferedLength;
         }
 
         using var putReq = new HttpRequestMessage(HttpMethod.Put, presignedPutUrl) { Content = putContent };
@@ -592,12 +623,26 @@ namespace S3Orchestrator_ExternalLogic
           putReq.Content.Headers.ContentType = new MediaTypeHeaderValue(contentType);
         putReq.Headers.ExpectContinue = false;
 
-        using var putResp = http.Send(putReq, HttpCompletionOption.ResponseHeadersRead);
-        putResp.EnsureSuccessStatusCode();
+        try
+        {
+          using var putResp = http.Send(putReq, HttpCompletionOption.ResponseHeadersRead);
+          putResp.EnsureSuccessStatusCode();
 
-        var etag = putResp.Headers.ETag?.Tag?.Trim('"') ?? string.Empty;
-        _logger.LogInformation("Upload to pre-signed S3 completed with ETag {ETag}", etag);
-        return etag;
+          var etag = putResp.Headers.ETag?.Tag?.Trim('"') ?? string.Empty;
+          _logger.LogInformation("Upload to pre-signed S3 completed with ETag {ETag}", etag);
+          return etag;
+        }
+        finally
+        {
+          if (tempFileStream != null)
+          {
+            tempFileStream.Dispose();
+          }
+          if (!string.IsNullOrWhiteSpace(tempFilePath))
+          {
+            try { File.Delete(tempFilePath); } catch { }
+          }
+        }
       }
       catch (Exception ex)
       {
@@ -633,9 +678,7 @@ namespace S3Orchestrator_ExternalLogic
         if (chunkSizeBytes <= 0 || chunkSizeBytes > maxChunkSize) chunkSizeBytes = maxChunkSize; // default to 25 MB
         if (timeoutSeconds <= 0) timeoutSeconds = 120;
 
-        using var http = new HttpClient(
-          new HttpClientHandler { AllowAutoRedirect = true, AutomaticDecompression = DecompressionMethods.None })
-        { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+        var http = GetHttpClient(timeoutSeconds);
 
         // A) Determine total length up-front so we ALWAYS send X-Chunk-Total
         var contentLength = TryGetContentLength(http, presignedGetUrl);
@@ -721,7 +764,7 @@ namespace S3Orchestrator_ExternalLogic
               {
                 var successHeader = GetHeaderValue(postResp, "success");
                 var errorHeader = GetHeaderValue(postResp, "errorMessage");
-                var body = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : string.Empty;
+                var body = postResp.Content != null ? Sync(postResp.Content.ReadAsStringAsync()) : string.Empty;
                 var binGuid = ExtractBinGuidFromBody(body);
 
                 bool success = ParseBool(successHeader ?? string.Empty) && postResp.IsSuccessStatusCode;
@@ -733,7 +776,7 @@ namespace S3Orchestrator_ExternalLogic
               {
                 if (!postResp.IsSuccessStatusCode)
                 {
-                  var msg = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}";
+                  var msg = postResp.Content != null ? Sync(postResp.Content.ReadAsStringAsync()) : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}";
                   attemptResult = new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = msg };
                 }
                 else
@@ -805,9 +848,7 @@ namespace S3Orchestrator_ExternalLogic
 
       // Disable transparent decompression to ensure exact byte-for-byte stream consistency
       using var s3 = CreateClient(authInfo);
-      using var http = new HttpClient(
-          new HttpClientHandler { AllowAutoRedirect = true, AutomaticDecompression = DecompressionMethods.None })
-      { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+      var http = GetHttpClient(timeoutSeconds);
 
       // Discover total size (so we know how many parts)
       var length = TryProbeLength(http, sourceUrl, binGuid, authHeaderName, authHeaderValue);
@@ -839,61 +880,111 @@ namespace S3Orchestrator_ExternalLogic
       try
       {
         // Initiate multipart
-        var initiate = s3.InitiateMultipartUploadAsync(new InitiateMultipartUploadRequest
+        var initiate = Sync(s3.InitiateMultipartUploadAsync(new InitiateMultipartUploadRequest
         {
           BucketName = bucketName,
           Key = key,
           ContentType = string.IsNullOrWhiteSpace(contentType) ? "application/octet-stream" : contentType
-        }).GetAwaiter().GetResult();
+        }));
 
         uploadId = initiate.UploadId;
 
+        const int maxAttempts = 3;
         long offset = 0;
         for (int partNumber = 1; partNumber <= totalParts; partNumber++)
         {
           int thisLen = (int)Math.Min(chunkSizeBytes, totalLength - offset);
           _logger.LogDebug("Uploading part {PartNumber}/{TotalParts} (offset {Offset}, length {Length})", partNumber, totalParts, offset, thisLen);
 
-          // GET slice from ODC REST (?binGuid=&offset=&length=)
-          var sliceUrl = AppendQueryParameter(
-                           AppendQueryParameter(
-                             AppendQueryParameter(sourceUrl, "binGuid", binGuid),
-                             "offset", offset.ToString()),
-                           "length", thisLen.ToString());
+          Exception? lastError = null;
+          bool uploaded = false;
 
-          using var getReq = new HttpRequestMessage(HttpMethod.Get, sliceUrl);
-          getReq.Headers.AcceptEncoding.Clear();
-          getReq.Headers.AcceptEncoding.ParseAdd("identity");
-          if (!string.IsNullOrWhiteSpace(authHeaderName) && !string.IsNullOrWhiteSpace(authHeaderValue))
-            getReq.Headers.TryAddWithoutValidation(authHeaderName, authHeaderValue);
-
-          using var getResp = http.Send(getReq, HttpCompletionOption.ResponseHeadersRead);
-          getResp.EnsureSuccessStatusCode();
-
-          using var src = getResp.Content.ReadAsStream();
-          // Read exactly thisLen bytes
-          int read = 0;
-          while (read < thisLen)
+          for (int attempt = 1; attempt <= maxAttempts; attempt++)
           {
-            int n = src.Read(buffer, read, thisLen - read);
-            if (n <= 0) throw new EndOfStreamException($"Unexpected EOF at offset {offset}, expected {thisLen - read} more bytes.");
-            read += n;
+            try
+            {
+              // GET slice from ODC REST (?binGuid=&offset=&length=)
+              var sliceUrl = AppendQueryParameter(
+                               AppendQueryParameter(
+                                 AppendQueryParameter(sourceUrl, "binGuid", binGuid),
+                                 "offset", offset.ToString()),
+                               "length", thisLen.ToString());
+
+              using var getReq = new HttpRequestMessage(HttpMethod.Get, sliceUrl);
+              getReq.Headers.AcceptEncoding.Clear();
+              getReq.Headers.AcceptEncoding.ParseAdd("identity");
+              if (!string.IsNullOrWhiteSpace(authHeaderName) && !string.IsNullOrWhiteSpace(authHeaderValue))
+                getReq.Headers.TryAddWithoutValidation(authHeaderName, authHeaderValue);
+
+              using var getResp = http.Send(getReq, HttpCompletionOption.ResponseHeadersRead);
+              if (!getResp.IsSuccessStatusCode)
+              {
+                if (IsTransientStatusCode(getResp.StatusCode) && attempt < maxAttempts)
+                {
+                  _logger.LogWarning("Transient status {StatusCode} fetching part {PartNumber}, attempt {Attempt}/{MaxAttempts}", getResp.StatusCode, partNumber, attempt, maxAttempts);
+                  DelayForRetry(attempt);
+                  continue;
+                }
+                getResp.EnsureSuccessStatusCode();
+              }
+
+              using var src = getResp.Content.ReadAsStream();
+              // Read exactly thisLen bytes
+              int read = 0;
+              while (read < thisLen)
+              {
+                int n = src.Read(buffer, read, thisLen - read);
+                if (n <= 0) throw new EndOfStreamException($"Unexpected EOF at offset {offset}, expected {thisLen - read} more bytes.");
+                read += n;
+              }
+
+              // Upload part
+              using var ms = new MemoryStream(buffer, 0, read, writable: false);
+              var uploadPartResponse = Sync(s3.UploadPartAsync(new UploadPartRequest
+              {
+                BucketName = bucketName,
+                Key = key,
+                UploadId = uploadId,
+                PartNumber = partNumber,
+                PartSize = read,
+                InputStream = ms
+              }));
+
+              partETags.Add(new PartETag(partNumber, uploadPartResponse.ETag));
+              offset += read;
+              uploaded = true;
+              break;
+            }
+            catch (AmazonS3Exception ex) when (IsTransientS3Exception(ex) && attempt < maxAttempts)
+            {
+              lastError = ex;
+              _logger.LogWarning(ex, "Transient S3 error uploading part {PartNumber}, attempt {Attempt}/{MaxAttempts}", partNumber, attempt, maxAttempts);
+              DelayForRetry(attempt);
+            }
+            catch (HttpRequestException ex) when (attempt < maxAttempts)
+            {
+              lastError = ex;
+              _logger.LogWarning(ex, "Transient HTTP error uploading part {PartNumber}, attempt {Attempt}/{MaxAttempts}", partNumber, attempt, maxAttempts);
+              DelayForRetry(attempt);
+            }
+            catch (TaskCanceledException ex) when (attempt < maxAttempts)
+            {
+              lastError = ex;
+              _logger.LogWarning(ex, "Timeout uploading part {PartNumber}, attempt {Attempt}/{MaxAttempts}", partNumber, attempt, maxAttempts);
+              DelayForRetry(attempt);
+            }
+            catch (IOException ex) when (attempt < maxAttempts)
+            {
+              lastError = ex;
+              _logger.LogWarning(ex, "I/O error uploading part {PartNumber}, attempt {Attempt}/{MaxAttempts}", partNumber, attempt, maxAttempts);
+              DelayForRetry(attempt);
+            }
           }
 
-          // Upload part
-          using var ms = new MemoryStream(buffer, 0, read, writable: false);
-          var uploadPartResponse = s3.UploadPartAsync(new UploadPartRequest
+          if (!uploaded)
           {
-            BucketName = bucketName,
-            Key = key,
-            UploadId = uploadId,
-            PartNumber = partNumber,
-            PartSize = read,
-            InputStream = ms
-          }).GetAwaiter().GetResult();
-
-          partETags.Add(new PartETag(partNumber, uploadPartResponse.ETag));
-          offset += read;
+            throw new InvalidOperationException($"Failed to upload part {partNumber} after {maxAttempts} attempts.", lastError);
+          }
         }
 
         // Complete multipart
@@ -910,7 +1001,7 @@ namespace S3Orchestrator_ExternalLogic
           return new UploadToS3Result { BinGuid = binGuid, Success = false, ErrorMessage = "No parts uploaded." };
         complete.AddPartETags(partETags);
 
-        s3.CompleteMultipartUploadAsync(complete).GetAwaiter().GetResult();
+        Sync(s3.CompleteMultipartUploadAsync(complete));
         _logger.LogInformation("Multipart upload completed in {ElapsedMs} ms for bucket {Bucket} and key {Key}", stopwatch.ElapsedMilliseconds, bucketName, key);
         // Successful completion means the object is committed in S3; we return a success status with the original binGuid reference.
         return new UploadToS3Result { BinGuid = binGuid, Success = true, ErrorMessage = string.Empty };
@@ -920,7 +1011,7 @@ namespace S3Orchestrator_ExternalLogic
         _logger.LogError(ex, "Multipart upload failed for bucket {Bucket} and key {Key}", bucketName, key);
         if (!string.IsNullOrEmpty(uploadId))
         {
-          try { s3.AbortMultipartUploadAsync(new AbortMultipartUploadRequest { BucketName = bucketName, Key = key, UploadId = uploadId }).GetAwaiter().GetResult(); }
+          try { Sync(s3.AbortMultipartUploadAsync(new AbortMultipartUploadRequest { BucketName = bucketName, Key = key, UploadId = uploadId })); }
           catch { /* best effort */ }
         }
         return new UploadToS3Result { BinGuid = binGuid, Success = false, ErrorMessage = ex.Message };
@@ -950,7 +1041,7 @@ namespace S3Orchestrator_ExternalLogic
           DestinationBucket = bucketName,
           DestinationKey = newKey
         };
-        s3.CopyObjectAsync(copyRequest).GetAwaiter().GetResult();
+        Sync(s3.CopyObjectAsync(copyRequest));
 
         // 2. Delete original
         var deleteRequest = new DeleteObjectRequest
@@ -958,7 +1049,7 @@ namespace S3Orchestrator_ExternalLogic
           BucketName = bucketName,
           Key = currentKey
         };
-        s3.DeleteObjectAsync(deleteRequest).GetAwaiter().GetResult();
+        Sync(s3.DeleteObjectAsync(deleteRequest));
 
         _logger.LogInformation("Renamed object in bucket {Bucket} from {CurrentKey} to {NewKey}", bucketName, currentKey, newKey);
         return true;
@@ -1005,7 +1096,7 @@ namespace S3Orchestrator_ExternalLogic
           BucketName = bucketName,
           Key = key
         };
-        s3.DeleteObjectAsync(deleteRequest).GetAwaiter().GetResult();
+        Sync(s3.DeleteObjectAsync(deleteRequest));
         _logger.LogInformation("Deleted file in bucket {Bucket} with key {Key}", bucketName, key);
         return true;
       }
@@ -1166,6 +1257,60 @@ namespace S3Orchestrator_ExternalLogic
       return null;
     }
 
+    private static void Sync(Task task)
+    {
+      task.ConfigureAwait(false).GetAwaiter().GetResult();
+    }
+
+    private static T Sync<T>(Task<T> task)
+    {
+      return task.ConfigureAwait(false).GetAwaiter().GetResult();
+    }
+
+    private static bool IsTransientStatusCode(HttpStatusCode statusCode)
+    {
+      return statusCode == HttpStatusCode.InternalServerError
+          || statusCode == HttpStatusCode.BadGateway
+          || statusCode == HttpStatusCode.ServiceUnavailable
+          || statusCode == HttpStatusCode.GatewayTimeout
+          || statusCode == HttpStatusCode.TooManyRequests
+          || statusCode == HttpStatusCode.Forbidden;
+    }
+
+    private static bool IsTransientS3Exception(AmazonS3Exception ex)
+    {
+      if (ex == null) return false;
+      if (string.Equals(ex.ErrorCode, "SlowDown", StringComparison.OrdinalIgnoreCase)) return true;
+      return IsTransientStatusCode(ex.StatusCode);
+    }
+
+    private static void DelayForRetry(int attempt)
+    {
+      System.Threading.Thread.Sleep(200 * attempt);
+    }
+
+    private static long BufferToTempFile(Stream src, string path)
+    {
+      const int bufferSize = 1024 * 1024; // 1 MB buffer to keep memory bounded
+      var buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
+      try
+      {
+        using var file = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
+        long total = 0;
+        int read;
+        while ((read = src.Read(buffer, 0, buffer.Length)) > 0)
+        {
+          file.Write(buffer, 0, read);
+          total += read;
+        }
+        return total;
+      }
+      finally
+      {
+        ArrayPool<byte>.Shared.Return(buffer);
+      }
+    }
+
     // Read up to count bytes; returns actual read (0 = EOF)
     private static int ReadFull(Stream s, byte[] buffer, int offset, int count)
     {
@@ -1266,7 +1411,10 @@ namespace S3Orchestrator_ExternalLogic
     {
       if (location == S3Region.USEast1) return "us-east-1";
       var raw = location?.Value;
-      return string.IsNullOrWhiteSpace(raw) ? "us-east-1" : raw;
+      if (string.IsNullOrWhiteSpace(raw)) return "us-east-1";
+      if (string.Equals(raw, "EU", StringComparison.OrdinalIgnoreCase)) return "eu-west-1";
+      if (string.Equals(raw, "US", StringComparison.OrdinalIgnoreCase)) return "us-east-1";
+      return raw;
     }
 
     private static string SafeHost(string url)
