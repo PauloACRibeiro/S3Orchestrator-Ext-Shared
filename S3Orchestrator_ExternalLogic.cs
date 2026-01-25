@@ -10,14 +10,11 @@ using Amazon.S3;
 using Amazon.S3.Model;
 
 //
-// -------- Version 1.0.9  --------
-// Added a BucketObjectInfo OS structure to carry S3Key, FileSize, and CreatedAt (uses S3’s last-modified timestamp normalized to UTC) 
-// Exposed a new OS action GetBucketContents on IPreSigner that accepts auth info and bucket name, returning the bucket contents as an array of BucketObjectInfo 
-// Added a new OS action RenameObject on IPreSigner that accepts auth info, bucket name, current object key, and new object key
-// Added a new OS action DeleteFile on IPreSigner that accepts auth info, bucket name, and object key
-// Added a new OS action MoveFile on IPreSigner that accepts auth info, bucket name, source object key, and target directory
-// Added a new OS action RenameFile on IPreSigner that accepts auth info, bucket name, current object key, and new object key
-// Fixed ListBuckets method structure (missing throw/brace) so the project builds successfully
+// -------- Version 1.0.11  --------
+// Added ListObjects action with prefix filtering and pagination (returns ListObjectsResult)
+// Removed GetBucketContents action (no consumers yet) in favor of ListObjects
+// Added ListObjectsResult OS structure to carry items and pagination token
+// Added GetObjectMetadata action returning ObjectMetadataInfo
 
 namespace S3Orchestrator_ExternalLogic
 {
@@ -74,6 +71,38 @@ namespace S3Orchestrator_ExternalLogic
     public DateTime CreatedAt { get; set; }
   }
 
+  [OSStructure(Description = "Result of listing objects in an S3 bucket")]
+  public struct ListObjectsResult
+  {
+    [OSStructureField(Description = "Objects returned for this page")]
+    public BucketObjectInfo[] Items { get; set; }
+
+    [OSStructureField(Description = "True if there are more objects to fetch")]
+    public bool IsTruncated { get; set; }
+
+    [OSStructureField(Description = "Continuation token for the next page (empty when done)")]
+    public string NextContinuationToken { get; set; }
+  }
+
+  [OSStructure(Description = "S3 object metadata")]
+  public struct ObjectMetadataInfo
+  {
+    [OSStructureField(Description = "Object key")]
+    public string Key { get; set; }
+
+    [OSStructureField(Description = "Size of the object in bytes")]
+    public long Size { get; set; }
+
+    [OSStructureField(Description = "Last modified timestamp of the object (UTC)")]
+    public DateTime LastModifiedUtc { get; set; }
+
+    [OSStructureField(Description = "Entity tag for the object (ETag)")]
+    public string ETag { get; set; }
+
+    [OSStructureField(Description = "Content-Type of the object")]
+    public string ContentType { get; set; }
+  }
+
   // -------- Interface (icon in resources folder) --------
   [OSInterface(
       Name = "S3Orchestrator_ExternalLogic",
@@ -97,10 +126,18 @@ namespace S3Orchestrator_ExternalLogic
       [OSParameter(Description = "Content-Type for the upload")] string contentType,
       [OSParameter(Description = "Duration in minutes")] int durationInMinutes);
 
-    [OSAction(Description = "List the contents of an S3 bucket")]
-    BucketObjectInfo[] GetBucketContents(
+    [OSAction(Description = "List objects in an S3 bucket with optional prefix filter and pagination")]
+    ListObjectsResult ListObjects(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
-      [OSParameter(Description = "Bucket name")] string bucketName);
+      [OSParameter(Description = "Bucket name")] string bucketName,
+      [OSParameter(Description = "Prefix filter (optional)")] string prefix,
+      [OSParameter(Description = "Continuation token (optional)")] string continuationToken);
+
+    [OSAction(Description = "Get metadata for an S3 object")]
+    ObjectMetadataInfo GetObjectMetadata(
+      [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
+      [OSParameter(Description = "Bucket name")] string bucketName,
+      [OSParameter(Description = "Object key")] string key);
 
     [OSAction(Description = "List S3 buckets available for the credentials")]
     string[] ListBuckets(
@@ -222,53 +259,98 @@ namespace S3Orchestrator_ExternalLogic
       }
     }
 
-    public BucketObjectInfo[] GetBucketContents(S3AuthInfo authInfo, string bucketName)
+    public ListObjectsResult ListObjects(S3AuthInfo authInfo, string bucketName, string prefix, string continuationToken)
     {
       try
       {
-        _logger.LogInformation("Listing contents of bucket {Bucket}", bucketName);
+        _logger.LogInformation("Listing objects for bucket {Bucket} with prefix {Prefix}", bucketName, prefix ?? string.Empty);
         if (string.IsNullOrWhiteSpace(authInfo.AccessKeyId)) throw new ArgumentException("AccessKeyId is required.");
         if (string.IsNullOrWhiteSpace(authInfo.SecretAccessKey)) throw new ArgumentException("SecretAccessKey is required.");
         if (string.IsNullOrWhiteSpace(authInfo.Region)) throw new ArgumentException("Region is required.");
         if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
 
         using var s3 = CreateClient(authInfo);
-        var items = new List<BucketObjectInfo>();
-        string? continuation = null;
-
-        do
+        var request = new ListObjectsV2Request
         {
-          var request = new ListObjectsV2Request
-          {
-            BucketName = bucketName,
-            ContinuationToken = continuation
-          };
+          BucketName = bucketName,
+          Prefix = string.IsNullOrWhiteSpace(prefix) ? null : prefix,
+          ContinuationToken = string.IsNullOrWhiteSpace(continuationToken) ? null : continuationToken
+        };
 
-          var response = s3.ListObjectsV2Async(request).GetAwaiter().GetResult();
-          _logger.LogDebug("Fetched {Count} objects from bucket {Bucket}", response.S3Objects?.Count ?? 0, bucketName);
-
-          if (response.S3Objects != null)
+        var response = s3.ListObjectsV2Async(request).GetAwaiter().GetResult();
+        var items = new List<BucketObjectInfo>();
+        if (response.S3Objects != null)
+        {
+          foreach (var obj in response.S3Objects)
           {
-            foreach (var obj in response.S3Objects)
+            items.Add(new BucketObjectInfo
             {
-              items.Add(new BucketObjectInfo
-              {
-                S3Key = obj.Key ?? string.Empty,
-                FileSize = obj.Size.GetValueOrDefault(),
-                CreatedAt = (obj.LastModified ?? DateTime.MinValue).ToUniversalTime()
-              });
-            }
+              S3Key = obj.Key ?? string.Empty,
+              FileSize = obj.Size.GetValueOrDefault(),
+              CreatedAt = (obj.LastModified ?? DateTime.MinValue).ToUniversalTime()
+            });
           }
+        }
 
-          continuation = response.IsTruncated == true ? response.NextContinuationToken : null;
-        } while (!string.IsNullOrEmpty(continuation));
+        var isTruncated = response.IsTruncated.GetValueOrDefault();
 
-        _logger.LogInformation("Listed {Count} objects from bucket {Bucket}", items.Count, bucketName);
-        return items.ToArray();
+        _logger.LogInformation(
+          "Listed {Count} objects from bucket {Bucket} (truncated={IsTruncated})",
+          items.Count,
+          bucketName,
+          isTruncated);
+
+        return new ListObjectsResult
+        {
+          Items = items.ToArray(),
+          IsTruncated = isTruncated,
+          NextContinuationToken = isTruncated ? (response.NextContinuationToken ?? string.Empty) : string.Empty
+        };
       }
       catch (Exception ex)
       {
-        _logger.LogError(ex, "Failed to list contents of bucket {Bucket}", bucketName);
+        _logger.LogError(ex, "Failed to list objects from bucket {Bucket}", bucketName);
+        throw;
+      }
+    }
+
+    public ObjectMetadataInfo GetObjectMetadata(S3AuthInfo authInfo, string bucketName, string key)
+    {
+      try
+      {
+        _logger.LogInformation("Getting metadata for bucket {Bucket} and key {Key}", bucketName, key);
+        Validate(authInfo, bucketName, key, 1);
+        ValidateS3Key(key);
+
+        using var s3 = CreateClient(authInfo);
+        var response = s3.GetObjectMetadataAsync(new GetObjectMetadataRequest
+        {
+          BucketName = bucketName,
+          Key = key
+        }).GetAwaiter().GetResult();
+
+        var etag = response.ETag ?? string.Empty;
+        if (!string.IsNullOrEmpty(etag)) etag = etag.Trim('"');
+
+        var lastModifiedUtc = response.LastModified.HasValue
+          ? response.LastModified.Value.ToUniversalTime()
+          : DateTime.MinValue;
+
+        var result = new ObjectMetadataInfo
+        {
+          Key = key,
+          Size = response.ContentLength,
+          LastModifiedUtc = lastModifiedUtc,
+          ETag = etag,
+          ContentType = response.ContentType ?? string.Empty
+        };
+
+        _logger.LogInformation("Retrieved metadata for bucket {Bucket} and key {Key}", bucketName, key);
+        return result;
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed to get metadata for bucket {Bucket} and key {Key}", bucketName, key);
         throw;
       }
     }
