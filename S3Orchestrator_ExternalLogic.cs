@@ -11,7 +11,7 @@ using Amazon.S3;
 using Amazon.S3.Model;
 
 //
-// -------- Version 1.0.12  --------
+// -------- Version 1.0.14  --------
 // CreateBucket omits location constraint for us-east-1 (classic) to avoid InvalidLocationConstraint
 // Normalize bucket location values (EU/US -> canonical) and return normalized values from GetBucketLocation
 // Presigned PUT spools unknown-length streams to a temp file (bounded memory)
@@ -665,6 +665,10 @@ namespace S3Orchestrator_ExternalLogic
       int timeoutSeconds)
     {
       var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+      HttpResponseMessage? getResp = null;
+      Stream? srcStream = null;
+      string? tempFilePath = null;
+      FileStream? tempFileStream = null;
       try
       {
         if (string.IsNullOrWhiteSpace(presignedGetUrl)) throw new ArgumentException("presignedGetUrl is required.");
@@ -681,21 +685,46 @@ namespace S3Orchestrator_ExternalLogic
         var http = GetHttpClient(timeoutSeconds);
 
         // A) Determine total length up-front so we ALWAYS send X-Chunk-Total
-        var contentLength = TryGetContentLength(http, presignedGetUrl);
+        long? contentLength = TryGetContentLength(http, presignedGetUrl);
         if (!contentLength.HasValue)
-          throw new InvalidOperationException("Cannot determine source length (HEAD and ranged GET both failed).");
+        {
+          _logger.LogWarning("Source length unavailable via HEAD/Range for host {SourceHost}; probing GET headers", SafeHost(presignedGetUrl));
+          getResp = OpenGetResponse(http, presignedGetUrl);
+          getResp.EnsureSuccessStatusCode();
+          contentLength = getResp.Content.Headers.ContentLength;
+
+          if (!contentLength.HasValue)
+          {
+            _logger.LogWarning("Source length missing from GET headers for host {SourceHost}; buffering to temporary file", SafeHost(presignedGetUrl));
+            tempFilePath = Path.GetTempFileName();
+            using (var responseStream = getResp.Content.ReadAsStream())
+            {
+              contentLength = BufferToTempFile(responseStream, tempFilePath);
+            }
+            getResp.Dispose();
+            getResp = null;
+            tempFileStream = new FileStream(tempFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            srcStream = tempFileStream;
+          }
+          else
+          {
+            srcStream = getResp.Content.ReadAsStream();
+          }
+        }
+
+        if (!contentLength.HasValue)
+          throw new InvalidOperationException("Cannot determine source length (HEAD/Range/GET failed).");
 
         int totalChunks = (int)((contentLength.Value + (chunkSizeBytes - 1)) / chunkSizeBytes);
         _logger.LogInformation("Source length {ContentLength} bytes, chunk size {ChunkSize} bytes, total chunks {TotalChunks}", contentLength.Value, chunkSizeBytes, totalChunks);
 
-        // Open streaming GET from S3
-        using var getReq = new HttpRequestMessage(HttpMethod.Get, presignedGetUrl);
-        getReq.Headers.AcceptEncoding.Clear();
-        getReq.Headers.AcceptEncoding.ParseAdd("identity");
-        using var getResp = http.Send(getReq, HttpCompletionOption.ResponseHeadersRead);
-        getResp.EnsureSuccessStatusCode();
-
-        var srcStream = getResp.Content.ReadAsStream();
+        // Open streaming GET from S3 (only if we didn't already open it above)
+        if (srcStream == null)
+        {
+          getResp = OpenGetResponse(http, presignedGetUrl);
+          getResp.EnsureSuccessStatusCode();
+          srcStream = getResp.Content.ReadAsStream();
+        }
         // B) Force a single content-type for all chunks
         var forcedContentType = string.IsNullOrWhiteSpace(targetContentType)
           ? "application/octet-stream"
@@ -820,6 +849,15 @@ namespace S3Orchestrator_ExternalLogic
       {
         _logger.LogError(ex, "Failed download from S3 host {SourceHost} to target host {TargetHost}", SafeHost(presignedGetUrl), SafeHost(targetUrl));
         throw;
+      }
+      finally
+      {
+        try { getResp?.Dispose(); } catch { }
+        if (tempFileStream != null) tempFileStream.Dispose();
+        if (!string.IsNullOrWhiteSpace(tempFilePath))
+        {
+          try { File.Delete(tempFilePath); } catch { }
+        }
       }
     }
 
@@ -1175,12 +1213,28 @@ namespace S3Orchestrator_ExternalLogic
             }
           }
         }
+        else if (resp.IsSuccessStatusCode)
+        {
+          var len = resp.Content.Headers.ContentLength;
+          if (len.HasValue) return len.Value;
+          if (resp.Headers.TryGetValues("Content-Length", out var hVals) &&
+              long.TryParse(hVals.FirstOrDefault(), out var headerLen))
+            return headerLen;
+        }
         System.Diagnostics.Debug.WriteLine($"[Probe] Status={(int)resp.StatusCode} CR={resp.Content.Headers.ContentRange} CL={resp.Content.Headers.ContentLength}");
       }
 
       catch { /* ignore */ }
 
       return null;
+    }
+
+    private static HttpResponseMessage OpenGetResponse(HttpClient http, string url)
+    {
+      var getReq = new HttpRequestMessage(HttpMethod.Get, url);
+      getReq.Headers.AcceptEncoding.Clear();
+      getReq.Headers.AcceptEncoding.ParseAdd("identity");
+      return http.Send(getReq, HttpCompletionOption.ResponseHeadersRead);
     }
 
     private static long? TryProbeLength(HttpClient http, string sourceUrl, string binGuid, string authHeaderName, string authHeaderValue)

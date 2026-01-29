@@ -16,4 +16,8 @@
     <EmbeddedResource Include="resources/S3Orchestrator_ExternalLogic_lib.png" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="Version1_06.cs" />
+  </ItemGroup>
+
 </Project>
