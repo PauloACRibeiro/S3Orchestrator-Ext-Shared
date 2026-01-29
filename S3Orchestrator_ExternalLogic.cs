@@ -177,6 +177,7 @@ namespace S3Orchestrator_ExternalLogic
       [OSParameter(Description = "Pre-signed S3 GET URL")] string presignedGetUrl,
       [OSParameter(Description = "Target ODC REST base URL (receives binary via POST)")] string targetUrl,
       [OSParameter(Description = "S3 object Key to append as URL parameter ?Key=<key>")] string s3ObjectKey,
+      [OSParameter(Description = "S3 bucket name to append as URL parameter ?BucketName=<bucket>")] string bucketName,
       [OSParameter(Description = "Auth header name for the target (e.g., Authorization)")] string targetAuthHeaderName,
       [OSParameter(Description = "Auth header value for the target")] string targetAuthHeaderValue,
       [OSParameter(Description = "Content-Type to send (fixed for all chunks; default application/octet-stream)")] string targetContentType,
@@ -658,6 +659,7 @@ namespace S3Orchestrator_ExternalLogic
       string presignedGetUrl,
       string targetUrl,
       string s3ObjectKey,
+      string bucketName,
       string targetAuthHeaderName,
       string targetAuthHeaderValue,
       string targetContentType,
@@ -674,6 +676,7 @@ namespace S3Orchestrator_ExternalLogic
         if (string.IsNullOrWhiteSpace(presignedGetUrl)) throw new ArgumentException("presignedGetUrl is required.");
         if (string.IsNullOrWhiteSpace(targetUrl)) throw new ArgumentException("targetUrl is required.");
         if (string.IsNullOrWhiteSpace(s3ObjectKey)) throw new ArgumentException("s3ObjectKey is required.");
+        if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
 
         _logger.LogInformation("Downloading from S3 host {SourceHost} to target host {TargetHost}", SafeHost(presignedGetUrl), SafeHost(targetUrl));
 
@@ -730,7 +733,9 @@ namespace S3Orchestrator_ExternalLogic
           ? "application/octet-stream"
           : targetContentType;
 
-        var targetWithKey = AppendQueryParameter(targetUrl, "Key", s3ObjectKey);
+        var targetWithKey = AppendQueryParameter(
+                              AppendQueryParameter(targetUrl, "Key", s3ObjectKey),
+                              "BucketName", bucketName);
 
         var uploadId = Guid.NewGuid().ToString("N");
         var buffer = ArrayPool<byte>.Shared.Rent(chunkSizeBytes);
