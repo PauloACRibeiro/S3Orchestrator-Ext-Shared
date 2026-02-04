@@ -11,7 +11,7 @@ using Amazon.S3;
 using Amazon.S3.Model;
 
 //
-// -------- Version 1.0.15  --------
+// -------- Version 1.0.16  --------
 // CreateBucket omits location constraint for us-east-1 (classic) to avoid InvalidLocationConstraint
 // Normalize bucket location values (EU/US -> canonical) and return normalized values from GetBucketLocation
 // Presigned PUT spools unknown-length streams to a temp file (bounded memory)
