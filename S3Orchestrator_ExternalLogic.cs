@@ -129,36 +129,42 @@ namespace S3Orchestrator_ExternalLogic
       [OSParameter(Description = "Content-Type for the upload")] string contentType,
       [OSParameter(Description = "Duration in minutes")] int durationInMinutes);
 
-    [OSAction(Description = "List objects in an S3 bucket with optional prefix filter and pagination")]
-    ListObjectsResult ListObjects(
+    [OSAction(Description = "List objects in an S3 bucket with optional prefix filter and pagination", ReturnName = "success")]
+    bool ListObjects(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
       [OSParameter(Description = "Prefix filter (optional)")] string prefix,
-      [OSParameter(Description = "Continuation token (optional)")] string continuationToken);
+      [OSParameter(Description = "Continuation token (optional)")] string continuationToken,
+      [OSParameter(Description = "Error message when success is false")] out string errormessage);
 
-    [OSAction(Description = "Get metadata for an S3 object")]
-    ObjectMetadataInfo GetObjectMetadata(
+    [OSAction(Description = "Get metadata for an S3 object", ReturnName = "success")]
+    bool GetObjectMetadata(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
-      [OSParameter(Description = "Object key")] string key);
+      [OSParameter(Description = "Object key")] string key,
+      [OSParameter(Description = "Error message when success is false")] out string errormessage);
 
-    [OSAction(Description = "List S3 buckets available for the credentials")]
-    string[] ListBuckets(
-      [OSParameter(Description = "Auth info")] S3AuthInfo authInfo);
-    [OSAction(Description = "Get the region for an S3 bucket")]
-    string GetBucketLocation(
+    [OSAction(Description = "List S3 buckets available for the credentials", ReturnName = "success")]
+    bool ListBuckets(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
-      [OSParameter(Description = "Bucket name")] string bucketName);
+      [OSParameter(Description = "Error message when success is false")] out string errormessage);
+    [OSAction(Description = "Get the region for an S3 bucket", ReturnName = "success")]
+    bool GetBucketLocation(
+      [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
+      [OSParameter(Description = "Bucket name")] string bucketName,
+      [OSParameter(Description = "Error message when success is false")] out string errormessage);
 
-    [OSAction(Description = "Create an S3 bucket")]
+    [OSAction(Description = "Create an S3 bucket", ReturnName = "success")]
     bool CreateBucket(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
-      [OSParameter(Description = "Bucket name")] string bucketName);
+      [OSParameter(Description = "Bucket name")] string bucketName,
+      [OSParameter(Description = "Error message when success is false")] out string errormessage);
 
-    [OSAction(Description = "Delete an S3 bucket (must be empty)")]
+    [OSAction(Description = "Delete an S3 bucket (must be empty)", ReturnName = "success")]
     bool DeleteBucket(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
-      [OSParameter(Description = "Bucket name")] string bucketName);
+      [OSParameter(Description = "Bucket name")] string bucketName,
+      [OSParameter(Description = "Error message when success is false")] out string errormessage);
 
     // Existing: single GET (ODC) -> single PUT (S3). Suitable while source responses stay under the platform cap.
     [OSAction(Description = "Upload to S3 using a pre-signed single-part PUT by streaming a binary from an ODC REST Source URL")]
@@ -198,32 +204,36 @@ namespace S3Orchestrator_ExternalLogic
       [OSParameter(Description = "Chunk size in bytes (min 5MB for S3 multipart; default 8MB)")] int chunkSizeBytes,
       [OSParameter(Description = "Timeout per request in seconds (default 120)")] int timeoutSeconds);
 
-    [OSAction(Description = "Rename an object in S3 by copying to a new key and deleting the old one")]
+    [OSAction(Description = "Rename an object in S3 by copying to a new key and deleting the old one", ReturnName = "success")]
     bool RenameObject(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
       [OSParameter(Description = "Current object key")] string currentKey,
-      [OSParameter(Description = "New object key")] string newKey);
+      [OSParameter(Description = "New object key")] string newKey,
+      [OSParameter(Description = "Error message when success is false")] out string errormessage);
 
-    [OSAction(Description = "Rename a file in S3 (change filename, keep directory)")]
+    [OSAction(Description = "Rename a file in S3 (change filename, keep directory)", ReturnName = "success")]
     bool RenameFile(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
       [OSParameter(Description = "Current object key")] string currentKey,
-      [OSParameter(Description = "New file name (without path)")] string newFileName);
+      [OSParameter(Description = "New file name (without path)")] string newFileName,
+      [OSParameter(Description = "Error message when success is false")] out string errormessage);
 
-    [OSAction(Description = "Delete a file in S3")]
+    [OSAction(Description = "Delete a file in S3", ReturnName = "success")]
     bool DeleteFile(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
-      [OSParameter(Description = "Object key")] string key);
+      [OSParameter(Description = "Object key")] string key,
+      [OSParameter(Description = "Error message when success is false")] out string errormessage);
 
-    [OSAction(Description = "Move a file in S3 to a new directory")]
+    [OSAction(Description = "Move a file in S3 to a new directory", ReturnName = "success")]
     bool MoveFile(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
       [OSParameter(Description = "Source object key")] string sourceKey,
-      [OSParameter(Description = "Target directory (can be empty for root)")] string targetDirectory);
+      [OSParameter(Description = "Target directory (can be empty for root)")] string targetDirectory,
+      [OSParameter(Description = "Error message when success is false")] out string errormessage);
   }
 
   // -------- Implementation --------
@@ -284,8 +294,9 @@ namespace S3Orchestrator_ExternalLogic
       }
     }
 
-    public ListObjectsResult ListObjects(S3AuthInfo authInfo, string bucketName, string prefix, string continuationToken)
+    public bool ListObjects(S3AuthInfo authInfo, string bucketName, string prefix, string continuationToken, out string errormessage)
     {
+      errormessage = string.Empty;
       try
       {
         _logger.LogInformation("Listing objects for bucket {Bucket} with prefix {Prefix}", bucketName, prefix ?? string.Empty);
@@ -325,22 +336,25 @@ namespace S3Orchestrator_ExternalLogic
           bucketName,
           isTruncated);
 
-        return new ListObjectsResult
+        _ = new ListObjectsResult
         {
           Items = items.ToArray(),
           IsTruncated = isTruncated,
           NextContinuationToken = isTruncated ? (response.NextContinuationToken ?? string.Empty) : string.Empty
         };
+        return true;
       }
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to list objects from bucket {Bucket}", bucketName);
-        throw;
+        errormessage = ex.Message;
+        return false;
       }
     }
 
-    public ObjectMetadataInfo GetObjectMetadata(S3AuthInfo authInfo, string bucketName, string key)
+    public bool GetObjectMetadata(S3AuthInfo authInfo, string bucketName, string key, out string errormessage)
     {
+      errormessage = string.Empty;
       try
       {
         _logger.LogInformation("Getting metadata for bucket {Bucket} and key {Key}", bucketName, key);
@@ -361,7 +375,7 @@ namespace S3Orchestrator_ExternalLogic
           ? response.LastModified.Value.ToUniversalTime()
           : DateTime.MinValue;
 
-        var result = new ObjectMetadataInfo
+        _ = new ObjectMetadataInfo
         {
           Key = key,
           Size = response.ContentLength,
@@ -371,17 +385,19 @@ namespace S3Orchestrator_ExternalLogic
         };
 
         _logger.LogInformation("Retrieved metadata for bucket {Bucket} and key {Key}", bucketName, key);
-        return result;
+        return true;
       }
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to get metadata for bucket {Bucket} and key {Key}", bucketName, key);
-        throw;
+        errormessage = ex.Message;
+        return false;
       }
     }
 
-    public string[] ListBuckets(S3AuthInfo authInfo)
+    public bool ListBuckets(S3AuthInfo authInfo, out string errormessage)
     {
+      errormessage = string.Empty;
       try
       {
         _logger.LogInformation("Listing S3 buckets for provided credentials.");
@@ -420,17 +436,19 @@ namespace S3Orchestrator_ExternalLogic
         }
 
         _logger.LogInformation("Listed {Count} buckets for provided credentials in region {Region}.", bucketNames.Count, targetRegion);
-        return bucketNames.ToArray();
+        return true;
       }
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to list buckets for provided credentials.");
-        throw;
+        errormessage = ex.Message;
+        return false;
       }
     }
 
-    public string GetBucketLocation(S3AuthInfo authInfo, string bucketName)
+    public bool GetBucketLocation(S3AuthInfo authInfo, string bucketName, out string errormessage)
     {
+      errormessage = string.Empty;
       try
       {
         _logger.LogInformation("Getting location for bucket {Bucket}", bucketName);
@@ -447,17 +465,19 @@ namespace S3Orchestrator_ExternalLogic
 
         var region = NormalizeBucketRegion(response.Location);
         _logger.LogInformation("Retrieved location {Region} for bucket {Bucket}", region, bucketName);
-        return region;
+        return true;
       }
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to get location for bucket {Bucket}", bucketName);
-        throw;
+        errormessage = ex.Message;
+        return false;
       }
     }
 
-    public bool CreateBucket(S3AuthInfo authInfo, string bucketName)
+    public bool CreateBucket(S3AuthInfo authInfo, string bucketName, out string errormessage)
     {
+      errormessage = string.Empty;
       try
       {
         _logger.LogInformation("Creating bucket {Bucket}", bucketName);
@@ -491,12 +511,14 @@ namespace S3Orchestrator_ExternalLogic
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to create bucket {Bucket}", bucketName);
-        throw;
+        errormessage = ex.Message;
+        return false;
       }
     }
 
-    public bool DeleteBucket(S3AuthInfo authInfo, string bucketName)
+    public bool DeleteBucket(S3AuthInfo authInfo, string bucketName, out string errormessage)
     {
+      errormessage = string.Empty;
       try
       {
         _logger.LogInformation("Deleting bucket {Bucket}", bucketName);
@@ -518,12 +540,14 @@ namespace S3Orchestrator_ExternalLogic
       catch (AmazonS3Exception ex) when (string.Equals(ex.ErrorCode, "BucketNotEmpty", StringComparison.OrdinalIgnoreCase))
       {
         _logger.LogError(ex, "Failed to delete bucket {Bucket} because it is not empty.", bucketName);
-        throw new InvalidOperationException("Bucket must be empty before deletion.", ex);
+        errormessage = "Bucket must be empty before deletion.";
+        return false;
       }
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to delete bucket {Bucket}", bucketName);
-        throw;
+        errormessage = ex.Message;
+        return false;
       }
     }
 
@@ -1065,8 +1089,9 @@ namespace S3Orchestrator_ExternalLogic
       }
     }
 
-    public bool RenameObject(S3AuthInfo authInfo, string bucketName, string currentKey, string newKey)
+    public bool RenameObject(S3AuthInfo authInfo, string bucketName, string currentKey, string newKey, out string errormessage)
     {
+      errormessage = string.Empty;
       try
       {
         _logger.LogInformation("Renaming object in bucket {Bucket} from {CurrentKey} to {NewKey}", bucketName, currentKey, newKey);
@@ -1100,33 +1125,45 @@ namespace S3Orchestrator_ExternalLogic
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to rename object in bucket {Bucket} from {CurrentKey} to {NewKey}", bucketName, currentKey, newKey);
-        throw;
+        errormessage = ex.Message;
+        return false;
       }
     }
 
-    public bool RenameFile(S3AuthInfo authInfo, string bucketName, string currentKey, string newFileName)
+    public bool RenameFile(S3AuthInfo authInfo, string bucketName, string currentKey, string newFileName, out string errormessage)
     {
-      _logger.LogInformation("Renaming file in bucket {Bucket} for key {CurrentKey} to new file name {NewFileName}", bucketName, currentKey, newFileName);
-      if (string.IsNullOrWhiteSpace(currentKey)) throw new ArgumentException("currentKey is required.");
-      if (string.IsNullOrWhiteSpace(newFileName)) throw new ArgumentException("newFileName is required.");
-      ValidateS3Key(currentKey);
-      // newFileName is not a full key yet, but we should validate it's not empty/weird
-      if (newFileName.Contains("/") || newFileName.Contains("\\")) throw new ArgumentException("newFileName cannot contain path separators.");
-
-      // Extract directory from currentKey
-      string directory = "";
-      int lastSlash = currentKey.LastIndexOf('/');
-      if (lastSlash >= 0)
+      errormessage = string.Empty;
+      try
       {
-        directory = currentKey.Substring(0, lastSlash + 1);
-      }
+        _logger.LogInformation("Renaming file in bucket {Bucket} for key {CurrentKey} to new file name {NewFileName}", bucketName, currentKey, newFileName);
+        if (string.IsNullOrWhiteSpace(currentKey)) throw new ArgumentException("currentKey is required.");
+        if (string.IsNullOrWhiteSpace(newFileName)) throw new ArgumentException("newFileName is required.");
+        ValidateS3Key(currentKey);
+        // newFileName is not a full key yet, but we should validate it's not empty/weird
+        if (newFileName.Contains("/") || newFileName.Contains("\\")) throw new ArgumentException("newFileName cannot contain path separators.");
 
-      string newKey = directory + newFileName;
-      return RenameObject(authInfo, bucketName, currentKey, newKey);
+        // Extract directory from currentKey
+        string directory = "";
+        int lastSlash = currentKey.LastIndexOf('/');
+        if (lastSlash >= 0)
+        {
+          directory = currentKey.Substring(0, lastSlash + 1);
+        }
+
+        string newKey = directory + newFileName;
+        return RenameObject(authInfo, bucketName, currentKey, newKey, out errormessage);
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed to rename file in bucket {Bucket} for key {CurrentKey} to new file name {NewFileName}", bucketName, currentKey, newFileName);
+        errormessage = ex.Message;
+        return false;
+      }
     }
 
-    public bool DeleteFile(S3AuthInfo authInfo, string bucketName, string key)
+    public bool DeleteFile(S3AuthInfo authInfo, string bucketName, string key, out string errormessage)
     {
+      errormessage = string.Empty;
       try
       {
         _logger.LogInformation("Deleting file in bucket {Bucket} with key {Key}", bucketName, key);
@@ -1146,28 +1183,39 @@ namespace S3Orchestrator_ExternalLogic
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to delete file in bucket {Bucket} with key {Key}", bucketName, key);
-        throw;
+        errormessage = ex.Message;
+        return false;
       }
     }
 
-    public bool MoveFile(S3AuthInfo authInfo, string bucketName, string sourceKey, string targetDirectory)
+    public bool MoveFile(S3AuthInfo authInfo, string bucketName, string sourceKey, string targetDirectory, out string errormessage)
     {
-      _logger.LogInformation("Moving file in bucket {Bucket} from {SourceKey} to directory {TargetDirectory}", bucketName, sourceKey, targetDirectory);
-      if (string.IsNullOrWhiteSpace(sourceKey)) throw new ArgumentException("sourceKey is required.");
-      ValidateS3Key(sourceKey);
-      
-      // targetDirectory can be empty (root), but if not empty, ensure it ends with /
-      if (!string.IsNullOrEmpty(targetDirectory) && !targetDirectory.EndsWith("/"))
+      errormessage = string.Empty;
+      try
       {
-        targetDirectory += "/";
+        _logger.LogInformation("Moving file in bucket {Bucket} from {SourceKey} to directory {TargetDirectory}", bucketName, sourceKey, targetDirectory);
+        if (string.IsNullOrWhiteSpace(sourceKey)) throw new ArgumentException("sourceKey is required.");
+        ValidateS3Key(sourceKey);
+
+        // targetDirectory can be empty (root), but if not empty, ensure it ends with /
+        if (!string.IsNullOrEmpty(targetDirectory) && !targetDirectory.EndsWith("/"))
+        {
+          targetDirectory += "/";
+        }
+
+        // Extract filename from sourceKey
+        string fileName = Path.GetFileName(sourceKey);
+        if (string.IsNullOrEmpty(fileName)) throw new ArgumentException("Could not determine filename from sourceKey.");
+
+        string newKey = targetDirectory + fileName;
+        return RenameObject(authInfo, bucketName, sourceKey, newKey, out errormessage);
       }
-
-      // Extract filename from sourceKey
-      string fileName = Path.GetFileName(sourceKey);
-      if (string.IsNullOrEmpty(fileName)) throw new ArgumentException("Could not determine filename from sourceKey.");
-
-      string newKey = targetDirectory + fileName;
-      return RenameObject(authInfo, bucketName, sourceKey, newKey);
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed to move file in bucket {Bucket} from {SourceKey} to directory {TargetDirectory}", bucketName, sourceKey, targetDirectory);
+        errormessage = ex.Message;
+        return false;
+      }
     }
 
     // ===== Helpers =====
