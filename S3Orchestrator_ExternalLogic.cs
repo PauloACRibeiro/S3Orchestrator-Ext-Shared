@@ -112,7 +112,7 @@ namespace S3Orchestrator_ExternalLogic
       IconResourceName = "S3Orchestrator_ExternalLogic.resources.S3Orchestrator_ExternalLogic_lib.png",
       Description = "Move large binaries between OutSystems REST and S3 by orchestrating AWS multipart uploads and downloads"
   )]
-  public interface IPreSigner
+  public interface IS3orchestrator
   {
     [OSAction(Description = "Create a pre-signed GET URL for an S3 object")]
     string GetObjectPreSignedUrl(
@@ -237,7 +237,7 @@ namespace S3Orchestrator_ExternalLogic
   }
 
   // -------- Implementation --------
-  public class PreSignerImpl : IPreSigner
+  public class S3orchestrator : IS3orchestrator
   {
     private static readonly SocketsHttpHandler SharedHttpHandler = new SocketsHttpHandler
     {
@@ -262,11 +262,11 @@ namespace S3Orchestrator_ExternalLogic
 
     private readonly ILogger _logger;
 
-    public PreSignerImpl() : this(NullLogger<PreSignerImpl>.Instance) { }
+    public S3orchestrator() : this(NullLogger<S3orchestrator>.Instance) { }
 
-    public PreSignerImpl(ILogger logger)
+    public S3orchestrator(ILogger logger)
     {
-      _logger = logger ?? NullLogger<PreSignerImpl>.Instance;
+      _logger = logger ?? NullLogger<S3orchestrator>.Instance;
     }
 
     public string GetObjectPreSignedUrl(S3AuthInfo authInfo, string bucketName, string key, int durationInMinutes)
