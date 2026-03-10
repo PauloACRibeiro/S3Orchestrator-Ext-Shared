@@ -11,8 +11,10 @@ using Amazon.S3;
 using Amazon.S3.Model;
 
 //
-// -------- Version 1.0.16  --------
+// -------- Version 1.0.19  --------
 // CreateBucket omits location constraint for us-east-1 (classic) to avoid InvalidLocationConstraint
+// CreateBucket now uses normalized region names and verifies the created bucket region after the request
+// BucketAlreadyOwnedByYou is treated as idempotent success only when the bucket resolves to the requested region
 // Normalize bucket location values (EU/US -> canonical) and return normalized values from GetBucketLocation
 // Presigned PUT spools unknown-length streams to a temp file (bounded memory)
 // Shared HttpClient/handler to reduce socket churn and DNS overhead
@@ -106,6 +108,36 @@ namespace S3Orchestrator_ExternalLogic
     public string ContentType { get; set; }
   }
 
+  [OSStructure(Description = "S3 bucket summary")]
+  public struct BucketSummaryInfo
+  {
+    [OSStructureField(Description = "Bucket name")]
+    public string BucketName { get; set; }
+
+    [OSStructureField(Description = "Normalized bucket region")]
+    public string Region { get; set; }
+
+    [OSStructureField(Description = "Bucket creation timestamp (UTC)")]
+    public DateTime CreatedAtUtc { get; set; }
+  }
+
+  [OSStructure(Description = "Result of listing S3 buckets")]
+  public struct ListBucketsResult
+  {
+    [OSStructureField(Description = "Buckets available in the requested region")]
+    public BucketSummaryInfo[] Items { get; set; }
+  }
+
+  [OSStructure(Description = "Normalized location for an S3 bucket")]
+  public struct BucketLocationInfo
+  {
+    [OSStructureField(Description = "Bucket name")]
+    public string BucketName { get; set; }
+
+    [OSStructureField(Description = "Normalized bucket region")]
+    public string Region { get; set; }
+  }
+
   // -------- Interface (icon in resources folder) --------
   [OSInterface(
       Name = "S3Orchestrator_ExternalLogic",
@@ -135,24 +167,28 @@ namespace S3Orchestrator_ExternalLogic
       [OSParameter(Description = "Bucket name")] string bucketName,
       [OSParameter(Description = "Prefix filter (optional)")] string prefix,
       [OSParameter(Description = "Continuation token (optional)")] string continuationToken,
-      [OSParameter(Description = "Error message when success is false")] out string errormessage);
+      [OSParameter(Description = "Error message when success is false")] out string errormessage,
+      [OSParameter(Description = "Listed objects and pagination data")] out ListObjectsResult listObjectsResult);
 
     [OSAction(Description = "Get metadata for an S3 object", ReturnName = "success")]
     bool GetObjectMetadata(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
       [OSParameter(Description = "Object key")] string key,
-      [OSParameter(Description = "Error message when success is false")] out string errormessage);
+      [OSParameter(Description = "Error message when success is false")] out string errormessage,
+      [OSParameter(Description = "Object metadata payload")] out ObjectMetadataInfo objectMetadataInfo);
 
     [OSAction(Description = "List S3 buckets available for the credentials", ReturnName = "success")]
     bool ListBuckets(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
-      [OSParameter(Description = "Error message when success is false")] out string errormessage);
+      [OSParameter(Description = "Error message when success is false")] out string errormessage,
+      [OSParameter(Description = "Bucket list payload")] out ListBucketsResult listBucketsResult);
     [OSAction(Description = "Get the region for an S3 bucket", ReturnName = "success")]
     bool GetBucketLocation(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
-      [OSParameter(Description = "Error message when success is false")] out string errormessage);
+      [OSParameter(Description = "Error message when success is false")] out string errormessage,
+      [OSParameter(Description = "Bucket location payload")] out BucketLocationInfo bucketLocationInfo);
 
     [OSAction(Description = "Create an S3 bucket", ReturnName = "success")]
     bool CreateBucket(
@@ -294,9 +330,15 @@ namespace S3Orchestrator_ExternalLogic
       }
     }
 
-    public bool ListObjects(S3AuthInfo authInfo, string bucketName, string prefix, string continuationToken, out string errormessage)
+    public bool ListObjects(S3AuthInfo authInfo, string bucketName, string prefix, string continuationToken, out string errormessage, out ListObjectsResult listObjectsResult)
     {
       errormessage = string.Empty;
+      listObjectsResult = new ListObjectsResult
+      {
+        Items = Array.Empty<BucketObjectInfo>(),
+        IsTruncated = false,
+        NextContinuationToken = string.Empty
+      };
       try
       {
         _logger.LogInformation("Listing objects for bucket {Bucket} with prefix {Prefix}", bucketName, prefix ?? string.Empty);
@@ -336,7 +378,7 @@ namespace S3Orchestrator_ExternalLogic
           bucketName,
           isTruncated);
 
-        _ = new ListObjectsResult
+        listObjectsResult = new ListObjectsResult
         {
           Items = items.ToArray(),
           IsTruncated = isTruncated,
@@ -352,9 +394,17 @@ namespace S3Orchestrator_ExternalLogic
       }
     }
 
-    public bool GetObjectMetadata(S3AuthInfo authInfo, string bucketName, string key, out string errormessage)
+    public bool GetObjectMetadata(S3AuthInfo authInfo, string bucketName, string key, out string errormessage, out ObjectMetadataInfo objectMetadataInfo)
     {
       errormessage = string.Empty;
+      objectMetadataInfo = new ObjectMetadataInfo
+      {
+        Key = string.Empty,
+        Size = 0,
+        LastModifiedUtc = DateTime.MinValue,
+        ETag = string.Empty,
+        ContentType = string.Empty
+      };
       try
       {
         _logger.LogInformation("Getting metadata for bucket {Bucket} and key {Key}", bucketName, key);
@@ -375,7 +425,7 @@ namespace S3Orchestrator_ExternalLogic
           ? response.LastModified.Value.ToUniversalTime()
           : DateTime.MinValue;
 
-        _ = new ObjectMetadataInfo
+        objectMetadataInfo = new ObjectMetadataInfo
         {
           Key = key,
           Size = response.ContentLength,
@@ -395,9 +445,13 @@ namespace S3Orchestrator_ExternalLogic
       }
     }
 
-    public bool ListBuckets(S3AuthInfo authInfo, out string errormessage)
+    public bool ListBuckets(S3AuthInfo authInfo, out string errormessage, out ListBucketsResult listBucketsResult)
     {
       errormessage = string.Empty;
+      listBucketsResult = new ListBucketsResult
+      {
+        Items = Array.Empty<BucketSummaryInfo>()
+      };
       try
       {
         _logger.LogInformation("Listing S3 buckets for provided credentials.");
@@ -407,8 +461,8 @@ namespace S3Orchestrator_ExternalLogic
 
         using var s3 = CreateClient(authInfo);
         var response = Sync(s3.ListBucketsAsync());
-        var targetRegion = authInfo.Region.Trim();
-        var bucketNames = new List<string>();
+        var targetRegion = NormalizeRegionName(authInfo.Region);
+        var buckets = new List<BucketSummaryInfo>();
 
         if (response.Buckets != null)
         {
@@ -426,7 +480,14 @@ namespace S3Orchestrator_ExternalLogic
               var location = NormalizeBucketRegion(locationResponse.Location);
               if (!string.Equals(location, targetRegion, StringComparison.OrdinalIgnoreCase)) continue;
 
-              bucketNames.Add(bucketName);
+              buckets.Add(new BucketSummaryInfo
+              {
+                BucketName = bucketName,
+                Region = location,
+                CreatedAtUtc = bucket.CreationDate.HasValue
+                  ? bucket.CreationDate.Value.ToUniversalTime()
+                  : DateTime.MinValue
+              });
             }
             catch (Exception ex)
             {
@@ -435,7 +496,12 @@ namespace S3Orchestrator_ExternalLogic
           }
         }
 
-        _logger.LogInformation("Listed {Count} buckets for provided credentials in region {Region}.", bucketNames.Count, targetRegion);
+        listBucketsResult = new ListBucketsResult
+        {
+          Items = buckets.ToArray()
+        };
+
+        _logger.LogInformation("Listed {Count} buckets for provided credentials in region {Region}.", buckets.Count, targetRegion);
         return true;
       }
       catch (Exception ex)
@@ -446,9 +512,14 @@ namespace S3Orchestrator_ExternalLogic
       }
     }
 
-    public bool GetBucketLocation(S3AuthInfo authInfo, string bucketName, out string errormessage)
+    public bool GetBucketLocation(S3AuthInfo authInfo, string bucketName, out string errormessage, out BucketLocationInfo bucketLocationInfo)
     {
       errormessage = string.Empty;
+      bucketLocationInfo = new BucketLocationInfo
+      {
+        BucketName = bucketName ?? string.Empty,
+        Region = string.Empty
+      };
       try
       {
         _logger.LogInformation("Getting location for bucket {Bucket}", bucketName);
@@ -464,6 +535,11 @@ namespace S3Orchestrator_ExternalLogic
         }));
 
         var region = NormalizeBucketRegion(response.Location);
+        bucketLocationInfo = new BucketLocationInfo
+        {
+          BucketName = bucketName,
+          Region = region
+        };
         _logger.LogInformation("Retrieved location {Region} for bucket {Bucket}", region, bucketName);
         return true;
       }
@@ -486,18 +562,18 @@ namespace S3Orchestrator_ExternalLogic
         if (string.IsNullOrWhiteSpace(authInfo.Region)) throw new ArgumentException("Region is required.");
         if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
 
+        var requestedRegion = NormalizeRegionName(authInfo.Region);
         using var s3 = CreateClient(authInfo);
-        var bucketRegion = S3Region.FindValue(authInfo.Region);
-        var isUsEast1 = string.Equals(bucketRegion?.Value, S3Region.USEast1.Value, StringComparison.OrdinalIgnoreCase)
-          || string.Equals(authInfo.Region, "us-east-1", StringComparison.OrdinalIgnoreCase);
+        var isUsEast1 = string.Equals(requestedRegion, "us-east-1", StringComparison.OrdinalIgnoreCase);
         var request = new PutBucketRequest
         {
-          BucketName = bucketName
+          BucketName = bucketName,
+          UseClientRegion = true
         };
 
         if (!isUsEast1)
         {
-          request.BucketRegion = bucketRegion;
+          request.BucketRegionName = requestedRegion;
         }
         else
         {
@@ -505,7 +581,59 @@ namespace S3Orchestrator_ExternalLogic
         }
 
         Sync(s3.PutBucketAsync(request));
-        _logger.LogInformation("Created bucket {Bucket}", bucketName);
+        if (TryGetBucketRegion(authInfo, bucketName, out var createdRegion, maxAttempts: 5))
+        {
+          if (!string.Equals(createdRegion, requestedRegion, StringComparison.OrdinalIgnoreCase))
+          {
+            _logger.LogError(
+              "Create bucket request for {Bucket} returned success, but resolved region {CreatedRegion} does not match requested region {RequestedRegion}.",
+              bucketName,
+              createdRegion,
+              requestedRegion);
+            errormessage = $"Bucket was created in region '{createdRegion}', not requested region '{requestedRegion}'.";
+            return false;
+          }
+
+          _logger.LogInformation("Created bucket {Bucket} in region {Region}", bucketName, createdRegion);
+        }
+        else
+        {
+          _logger.LogWarning(
+            "Bucket {Bucket} create request succeeded, but region verification did not complete. Requested region was {RequestedRegion}.",
+            bucketName,
+            requestedRegion);
+        }
+
+        return true;
+      }
+      catch (AmazonS3Exception ex) when (string.Equals(ex.ErrorCode, "BucketAlreadyOwnedByYou", StringComparison.OrdinalIgnoreCase))
+      {
+        var requestedRegion = NormalizeRegionName(authInfo.Region);
+        if (TryGetBucketRegion(authInfo, bucketName, out var existingRegion, maxAttempts: 5))
+        {
+          if (string.Equals(existingRegion, requestedRegion, StringComparison.OrdinalIgnoreCase))
+          {
+            _logger.LogInformation(
+              "Bucket {Bucket} already exists and is owned by the caller in region {Region}; treating create as successful.",
+              bucketName,
+              existingRegion);
+            return true;
+          }
+
+          _logger.LogError(
+            ex,
+            "Bucket {Bucket} already exists and is owned by the caller, but in region {ExistingRegion} instead of requested region {RequestedRegion}.",
+            bucketName,
+            existingRegion,
+            requestedRegion);
+          errormessage = $"Bucket already exists and is owned by you in region '{existingRegion}', not requested region '{requestedRegion}'.";
+          return false;
+        }
+
+        _logger.LogWarning(
+          ex,
+          "Bucket {Bucket} already exists and is owned by the caller; region lookup failed, so treating create as successful.",
+          bucketName);
         return true;
       }
       catch (Exception ex)
@@ -1171,6 +1299,24 @@ namespace S3Orchestrator_ExternalLogic
         ValidateS3Key(key);
 
         using var s3 = CreateClient(authInfo);
+        try
+        {
+          Sync(s3.GetObjectMetadataAsync(new GetObjectMetadataRequest
+          {
+            BucketName = bucketName,
+            Key = key
+          }));
+        }
+        catch (AmazonS3Exception ex) when (
+          ex.StatusCode == HttpStatusCode.NotFound ||
+          string.Equals(ex.ErrorCode, "NoSuchKey", StringComparison.OrdinalIgnoreCase) ||
+          string.Equals(ex.ErrorCode, "NotFound", StringComparison.OrdinalIgnoreCase))
+        {
+          _logger.LogWarning("Cannot delete file in bucket {Bucket} with key {Key} because it was not found.", bucketName, key);
+          errormessage = "File not found.";
+          return false;
+        }
+
         var deleteRequest = new DeleteObjectRequest
         {
           BucketName = bucketName,
@@ -1493,9 +1639,48 @@ namespace S3Orchestrator_ExternalLogic
       if (System.Text.Encoding.UTF8.GetByteCount(key) > 1024) throw new ArgumentException("S3 Key is too long (max 1024 bytes).");
     }
 
+    private bool TryGetBucketRegion(S3AuthInfo authInfo, string bucketName, out string region, int maxAttempts = 1)
+    {
+      region = string.Empty;
+      if (maxAttempts <= 0) maxAttempts = 1;
+
+      for (var attempt = 1; attempt <= maxAttempts; attempt++)
+      {
+        try
+        {
+          using var s3 = CreateClient(authInfo);
+          var response = Sync(s3.GetBucketLocationAsync(new GetBucketLocationRequest
+          {
+            BucketName = bucketName
+          }));
+          region = NormalizeBucketRegion(response.Location);
+          return true;
+        }
+        catch (Exception lookupEx)
+        {
+          if (attempt >= maxAttempts)
+          {
+            _logger.LogWarning(lookupEx, "Failed to resolve region for bucket {Bucket}", bucketName);
+            return false;
+          }
+
+          _logger.LogWarning(
+            lookupEx,
+            "Attempt {Attempt} of {MaxAttempts} failed to resolve region for bucket {Bucket}; retrying.",
+            attempt,
+            maxAttempts,
+            bucketName);
+          System.Threading.Thread.Sleep(200 * attempt);
+        }
+      }
+
+      return false;
+    }
+
     private static AmazonS3Client CreateClient(S3AuthInfo auth)
     {
-      var region = RegionEndpoint.GetBySystemName(auth.Region);
+      var normalizedRegion = NormalizeRegionName(auth.Region);
+      var region = RegionEndpoint.GetBySystemName(normalizedRegion);
 
       // Force a stable, region-scoped endpoint and avoid host-prefix injection
       // so the SDK does not transform the hostname into environment/VPC-specific
@@ -1504,7 +1689,7 @@ namespace S3Orchestrator_ExternalLogic
       {
         RegionEndpoint = region,
         // Explicit service URL keeps the hostname stable (s3.{region}.amazonaws.com)
-        ServiceURL = $"https://s3.{auth.Region}.amazonaws.com",
+        ServiceURL = $"https://s3.{normalizedRegion}.amazonaws.com",
         ForcePathStyle = true,                 // use path-style: https://s3.{region}.amazonaws.com/bucket/key
         DisableHostPrefixInjection = true,     // avoid bucket-name host prefixing
         UseDualstackEndpoint = false,          // keep IPv4-only to avoid unexpected AAAA resolution issues
@@ -1518,10 +1703,16 @@ namespace S3Orchestrator_ExternalLogic
     {
       if (location == S3Region.USEast1) return "us-east-1";
       var raw = location?.Value;
-      if (string.IsNullOrWhiteSpace(raw)) return "us-east-1";
-      if (string.Equals(raw, "EU", StringComparison.OrdinalIgnoreCase)) return "eu-west-1";
-      if (string.Equals(raw, "US", StringComparison.OrdinalIgnoreCase)) return "us-east-1";
-      return raw;
+      return NormalizeRegionName(raw);
+    }
+
+    private static string NormalizeRegionName(string? region)
+    {
+      if (string.IsNullOrWhiteSpace(region)) return "us-east-1";
+      var trimmed = region.Trim();
+      if (string.Equals(trimmed, "EU", StringComparison.OrdinalIgnoreCase)) return "eu-west-1";
+      if (string.Equals(trimmed, "US", StringComparison.OrdinalIgnoreCase)) return "us-east-1";
+      return trimmed.ToLowerInvariant();
     }
 
     private static string SafeHost(string url)
