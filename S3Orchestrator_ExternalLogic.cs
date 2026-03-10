@@ -11,10 +11,11 @@ using Amazon.S3;
 using Amazon.S3.Model;
 
 //
-// -------- Version 1.0.19  --------
+// -------- Version 1.0.21  --------
 // CreateBucket omits location constraint for us-east-1 (classic) to avoid InvalidLocationConstraint
-// CreateBucket now uses normalized region names and verifies the created bucket region after the request
-// BucketAlreadyOwnedByYou is treated as idempotent success only when the bucket resolves to the requested region
+// Bucket region resolution now uses HeadBucket, which AWS recommends over GetBucketLocation
+// CreateBucket now confirms the bucket exists in the requested region before returning success
+// CreateBucket now returns false with a clear message when the bucket already exists
 // Normalize bucket location values (EU/US -> canonical) and return normalized values from GetBucketLocation
 // Presigned PUT spools unknown-length streams to a temp file (bounded memory)
 // Shared HttpClient/handler to reduce socket churn and DNS overhead
@@ -470,29 +471,22 @@ namespace S3Orchestrator_ExternalLogic
           {
             if (string.IsNullOrWhiteSpace(bucket.BucketName)) continue;
             var bucketName = bucket.BucketName;
-            try
+            if (!TryGetBucketRegion(s3, bucketName, out var location, maxAttempts: 3))
             {
-              var locationResponse = Sync(s3.GetBucketLocationAsync(new GetBucketLocationRequest
-              {
-                BucketName = bucketName
-              }));
-
-              var location = NormalizeBucketRegion(locationResponse.Location);
-              if (!string.Equals(location, targetRegion, StringComparison.OrdinalIgnoreCase)) continue;
-
-              buckets.Add(new BucketSummaryInfo
-              {
-                BucketName = bucketName,
-                Region = location,
-                CreatedAtUtc = bucket.CreationDate.HasValue
-                  ? bucket.CreationDate.Value.ToUniversalTime()
-                  : DateTime.MinValue
-              });
+              _logger.LogWarning("Failed to resolve region for bucket {Bucket}; skipping.", bucketName);
+              continue;
             }
-            catch (Exception ex)
+
+            if (!string.Equals(location, targetRegion, StringComparison.OrdinalIgnoreCase)) continue;
+
+            buckets.Add(new BucketSummaryInfo
             {
-              _logger.LogWarning(ex, "Failed to resolve region for bucket {Bucket}; skipping.", bucketName);
-            }
+              BucketName = bucketName,
+              Region = location,
+              CreatedAtUtc = bucket.CreationDate.HasValue
+                ? bucket.CreationDate.Value.ToUniversalTime()
+                : DateTime.MinValue
+            });
           }
         }
 
@@ -528,13 +522,12 @@ namespace S3Orchestrator_ExternalLogic
         if (string.IsNullOrWhiteSpace(authInfo.Region)) throw new ArgumentException("Region is required.");
         if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
 
-        using var s3 = CreateClient(authInfo);
-        var response = Sync(s3.GetBucketLocationAsync(new GetBucketLocationRequest
+        if (!TryGetBucketRegion(authInfo, bucketName, out var region, maxAttempts: 3))
         {
-          BucketName = bucketName
-        }));
+          errormessage = "Bucket location could not be resolved with HeadBucket.";
+          return false;
+        }
 
-        var region = NormalizeBucketRegion(response.Location);
         bucketLocationInfo = new BucketLocationInfo
         {
           BucketName = bucketName,
@@ -581,7 +574,7 @@ namespace S3Orchestrator_ExternalLogic
         }
 
         Sync(s3.PutBucketAsync(request));
-        if (TryGetBucketRegion(authInfo, bucketName, out var createdRegion, maxAttempts: 5))
+        if (TryGetBucketRegion(authInfo, bucketName, out var createdRegion, maxAttempts: 10))
         {
           if (!string.Equals(createdRegion, requestedRegion, StringComparison.OrdinalIgnoreCase))
           {
@@ -598,10 +591,12 @@ namespace S3Orchestrator_ExternalLogic
         }
         else
         {
-          _logger.LogWarning(
-            "Bucket {Bucket} create request succeeded, but region verification did not complete. Requested region was {RequestedRegion}.",
+          _logger.LogError(
+            "Bucket {Bucket} create request returned success, but the bucket could not be confirmed with HeadBucket. Requested region was {RequestedRegion}.",
             bucketName,
             requestedRegion);
+          errormessage = "Bucket creation request completed, but the bucket could not be confirmed with HeadBucket.";
+          return false;
         }
 
         return true;
@@ -609,32 +604,40 @@ namespace S3Orchestrator_ExternalLogic
       catch (AmazonS3Exception ex) when (string.Equals(ex.ErrorCode, "BucketAlreadyOwnedByYou", StringComparison.OrdinalIgnoreCase))
       {
         var requestedRegion = NormalizeRegionName(authInfo.Region);
-        if (TryGetBucketRegion(authInfo, bucketName, out var existingRegion, maxAttempts: 5))
+        if (TryGetBucketRegion(authInfo, bucketName, out var existingRegion, maxAttempts: 10))
         {
           if (string.Equals(existingRegion, requestedRegion, StringComparison.OrdinalIgnoreCase))
           {
-            _logger.LogInformation(
-              "Bucket {Bucket} already exists and is owned by the caller in region {Region}; treating create as successful.",
+            _logger.LogWarning(
+              "Bucket {Bucket} already exists and is owned by the caller in region {Region}.",
               bucketName,
               existingRegion);
-            return true;
+            errormessage = $"Bucket '{bucketName}' already exists and is owned by you in region '{existingRegion}'.";
+            return false;
           }
 
-          _logger.LogError(
+          _logger.LogWarning(
             ex,
             "Bucket {Bucket} already exists and is owned by the caller, but in region {ExistingRegion} instead of requested region {RequestedRegion}.",
             bucketName,
             existingRegion,
             requestedRegion);
-          errormessage = $"Bucket already exists and is owned by you in region '{existingRegion}', not requested region '{requestedRegion}'.";
+          errormessage = $"Bucket '{bucketName}' already exists and is owned by you in region '{existingRegion}', not requested region '{requestedRegion}'.";
           return false;
         }
 
         _logger.LogWarning(
           ex,
-          "Bucket {Bucket} already exists and is owned by the caller; region lookup failed, so treating create as successful.",
+          "Bucket {Bucket} already exists and is owned by the caller, but HeadBucket could not confirm its region.",
           bucketName);
-        return true;
+        errormessage = $"Bucket '{bucketName}' already exists and is owned by you.";
+        return false;
+      }
+      catch (AmazonS3Exception ex) when (string.Equals(ex.ErrorCode, "BucketAlreadyExists", StringComparison.OrdinalIgnoreCase))
+      {
+        _logger.LogWarning(ex, "Bucket {Bucket} already exists and is owned by another account.", bucketName);
+        errormessage = $"Bucket '{bucketName}' already exists.";
+        return false;
       }
       catch (Exception ex)
       {
@@ -1641,6 +1644,12 @@ namespace S3Orchestrator_ExternalLogic
 
     private bool TryGetBucketRegion(S3AuthInfo authInfo, string bucketName, out string region, int maxAttempts = 1)
     {
+      using var s3 = CreateClient(authInfo);
+      return TryGetBucketRegion(s3, bucketName, out region, maxAttempts);
+    }
+
+    private bool TryGetBucketRegion(IAmazonS3 s3, string bucketName, out string region, int maxAttempts = 1)
+    {
       region = string.Empty;
       if (maxAttempts <= 0) maxAttempts = 1;
 
@@ -1648,12 +1657,11 @@ namespace S3Orchestrator_ExternalLogic
       {
         try
         {
-          using var s3 = CreateClient(authInfo);
-          var response = Sync(s3.GetBucketLocationAsync(new GetBucketLocationRequest
+          var response = Sync(s3.HeadBucketAsync(new HeadBucketRequest
           {
             BucketName = bucketName
           }));
-          region = NormalizeBucketRegion(response.Location);
+          region = NormalizeRegionName(response.BucketRegion);
           return true;
         }
         catch (Exception lookupEx)
