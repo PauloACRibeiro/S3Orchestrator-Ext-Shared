@@ -1,8 +1,13 @@
 ﻿using System.Buffers;
+using System.Diagnostics;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Collections.Concurrent;
+using System.Text;
 using System.Text.Json;
+using System.Runtime.InteropServices;
+using System.Reflection;
 using OutSystems.ExternalLibraries.SDK;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -11,7 +16,8 @@ using Amazon.S3;
 using Amazon.S3.Model;
 
 //
-// -------- Version 1.0.21  --------
+// -------- Version 1.0.30  --------
+// Add qpdf-based S3 PDF normalization and validation helpers for structural PDF rewrite experiments.
 // CreateBucket omits location constraint for us-east-1 (classic) to avoid InvalidLocationConstraint
 // Bucket region resolution now uses HeadBucket, which AWS recommends over GetBucketLocation
 // CreateBucket now confirms the bucket exists in the requested region before returning success
@@ -139,6 +145,59 @@ namespace S3Orchestrator_ExternalLogic
     public string Region { get; set; }
   }
 
+  [OSStructure(Description = "Result of checking a PDF in S3 with qpdf")]
+  public struct QpdfCheckResult
+  {
+    [OSStructureField(Description = "Bucket name")]
+    public string BucketName { get; set; }
+
+    [OSStructureField(Description = "Object key")]
+    public string Key { get; set; }
+
+    [OSStructureField(Description = "qpdf exit code")]
+    public int ExitCode { get; set; }
+
+    [OSStructureField(Description = "True when qpdf reported warnings but no errors")]
+    public bool HasWarnings { get; set; }
+
+    [OSStructureField(Description = "True when qpdf reported the file as linearized")]
+    public bool IsLinearized { get; set; }
+
+    [OSStructureField(Description = "True when qpdf reported the file as encrypted")]
+    public bool IsEncrypted { get; set; }
+
+    [OSStructureField(Description = "Combined qpdf stdout/stderr text")]
+    public string OutputText { get; set; }
+  }
+
+  [OSStructure(Description = "Result of normalizing a PDF in S3 with qpdf")]
+  public struct QpdfNormalizeResult
+  {
+    [OSStructureField(Description = "Bucket name")]
+    public string BucketName { get; set; }
+
+    [OSStructureField(Description = "Object key")]
+    public string Key { get; set; }
+
+    [OSStructureField(Description = "Normalization mode used")]
+    public string Mode { get; set; }
+
+    [OSStructureField(Description = "Original object size in bytes")]
+    public long OriginalSize { get; set; }
+
+    [OSStructureField(Description = "Normalized object size in bytes")]
+    public long OutputSize { get; set; }
+
+    [OSStructureField(Description = "ETag returned by S3 for the normalized object")]
+    public string OutputETag { get; set; }
+
+    [OSStructureField(Description = "True when the preflight qpdf check returned warnings")]
+    public bool PreCheckHadWarnings { get; set; }
+
+    [OSStructureField(Description = "qpdf diagnostics from normalization; duplicate check reports are collapsed")]
+    public string OutputText { get; set; }
+  }
+
   // -------- Interface (icon in resources folder) --------
   [OSInterface(
       Name = "S3Orchestrator_ExternalLogic",
@@ -227,6 +286,18 @@ namespace S3Orchestrator_ExternalLogic
       [OSParameter(Description = "Chunk size in bytes (default 25,000,000 ≈ 25 MB)")] int chunkSizeBytes,
       [OSParameter(Description = "Timeout per chunk request in seconds (default 120)")] int timeoutSeconds);
 
+    [OSAction(Description = "Download from S3 (pre-signed GET), encode each chunk as base64 text, and POST in parts to an ODC REST target")]
+    DownloadToRestResult DownloadFromPresignedUrlToRestBase64(
+      [OSParameter(Description = "Pre-signed S3 GET URL")] string presignedGetUrl,
+      [OSParameter(Description = "Target ODC REST base URL (receives base64 text via POST)")] string targetUrl,
+      [OSParameter(Description = "S3 object Key to append as URL parameter ?Key=<key>")] string s3ObjectKey,
+      [OSParameter(Description = "S3 bucket name to append as URL parameter ?BucketName=<bucket>")] string bucketName,
+      [OSParameter(Description = "Auth header name for the target (e.g., Authorization)")] string targetAuthHeaderName,
+      [OSParameter(Description = "Auth header value for the target")] string targetAuthHeaderValue,
+      [OSParameter(Description = "Reserved for compatibility; base64 endpoint enforces text/plain; charset=utf-8")] string targetContentType,
+      [OSParameter(Description = "Raw chunk size in bytes (default/max 18,000,000 for base64 headroom)")] int chunkSizeBytes,
+      [OSParameter(Description = "Timeout per chunk request in seconds (default 120)")] int timeoutSeconds);
+
     // NEW: Large files – source is fetched in many small responses; target uses S3 Multipart Upload (no presigned URL).
     [OSAction(Description = "Upload a large binary from ODC REST to S3 using MULTIPART (pull source in chunks)")]
     UploadToS3Result UploadFromRestToS3Multipart(
@@ -242,40 +313,62 @@ namespace S3Orchestrator_ExternalLogic
       [OSParameter(Description = "Timeout per request in seconds (default 120)")] int timeoutSeconds);
 
     [OSAction(Description = "Rename an object in S3 by copying to a new key and deleting the old one", ReturnName = "success")]
-    bool RenameObject(
+    bool RenameMoveObject(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
       [OSParameter(Description = "Current object key")] string currentKey,
       [OSParameter(Description = "New object key")] string newKey,
       [OSParameter(Description = "Error message when success is false")] out string errormessage);
 
-    [OSAction(Description = "Rename a file in S3 (change filename, keep directory)", ReturnName = "success")]
-    bool RenameFile(
+    [OSAction(Description = "Rename an object in S3 (change filename, keep directory)", ReturnName = "success")]
+    bool RenameObject(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
       [OSParameter(Description = "Current object key")] string currentKey,
       [OSParameter(Description = "New file name (without path)")] string newFileName,
       [OSParameter(Description = "Error message when success is false")] out string errormessage);
 
-    [OSAction(Description = "Delete a file in S3", ReturnName = "success")]
-    bool DeleteFile(
+    [OSAction(Description = "Delete an object in S3", ReturnName = "success")]
+    bool DeleteObject(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
       [OSParameter(Description = "Object key")] string key,
       [OSParameter(Description = "Error message when success is false")] out string errormessage);
 
-    [OSAction(Description = "Move a file in S3 to a new directory", ReturnName = "success")]
-    bool MoveFile(
+    [OSAction(Description = "Move an object in S3 to a new directory", ReturnName = "success")]
+    bool MoveObject(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
       [OSParameter(Description = "Source object key")] string sourceKey,
       [OSParameter(Description = "Target directory (can be empty for root)")] string targetDirectory,
       [OSParameter(Description = "Error message when success is false")] out string errormessage);
+
+    [OSAction(Description = "Run qpdf validation against a PDF stored in S3", ReturnName = "success")]
+    bool CheckPdfInS3WithQpdf(
+      [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
+      [OSParameter(Description = "Bucket name")] string bucketName,
+      [OSParameter(Description = "Object key")] string key,
+      [OSParameter(Description = "Error message when success is false")] out string errormessage,
+      [OSParameter(Description = "qpdf check result payload")] out QpdfCheckResult checkResult);
+
+    [OSAction(Description = "Normalize a PDF stored in S3 with qpdf and overwrite the same key on success", ReturnName = "success")]
+    bool NormalizePdfInS3WithQpdf(
+      [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
+      [OSParameter(Description = "Bucket name")] string bucketName,
+      [OSParameter(Description = "Object key")] string key,
+      [OSParameter(Description = "Mode: Linearize, FlattenAnnotationsAll, FlattenAnnotationsPrint, or FlattenAnnotationsScreen")] string mode,
+      [OSParameter(Description = "Error message when success is false")] out string errormessage,
+      [OSParameter(Description = "qpdf normalization result payload")] out QpdfNormalizeResult normalizeResult);
   }
 
   // -------- Implementation --------
   public class S3orchestrator : IS3orchestrator
   {
+    private const string QpdfBundleFileName = "qpdf-12.3.0-bin-linux-x86_64.zip";
+    private const string QpdfBundleRelativePath = "resources/qpdf/" + QpdfBundleFileName;
+    private const string QpdfVersion = "12.3.0";
+    private const long MaxQpdfSourceBytes = 100L * 1024 * 1024;
+
     private static readonly SocketsHttpHandler SharedHttpHandler = new SocketsHttpHandler
     {
       AllowAutoRedirect = true,
@@ -284,6 +377,13 @@ namespace S3Orchestrator_ExternalLogic
     };
 
     private static readonly ConcurrentDictionary<int, HttpClient> HttpClients = new ConcurrentDictionary<int, HttpClient>();
+    private static readonly object QpdfExtractLock = new object();
+    // AWSSDK.S3 4.0.x carries the HeadBucket x-amz-bucket-region hint on a non-public
+    // exception member, so cache the reflective accessors once and use them as a fallback.
+    private static readonly PropertyInfo? AmazonS3ExceptionRegionProperty =
+      typeof(AmazonS3Exception).GetProperty("Region", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+    private static readonly FieldInfo? AmazonS3ExceptionRegionField =
+      typeof(AmazonS3Exception).GetField("<Region>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic);
 
     private static HttpClient GetHttpClient(int timeoutSeconds)
     {
@@ -304,6 +404,12 @@ namespace S3Orchestrator_ExternalLogic
     public S3orchestrator(ILogger logger)
     {
       _logger = logger ?? NullLogger<S3orchestrator>.Instance;
+    }
+
+    private sealed class QpdfExecutionResult
+    {
+      public int ExitCode { get; set; }
+      public string OutputText { get; set; } = string.Empty;
     }
 
     public string GetObjectPreSignedUrl(S3AuthInfo authInfo, string bucketName, string key, int durationInMinutes)
@@ -519,12 +625,20 @@ namespace S3Orchestrator_ExternalLogic
         _logger.LogInformation("Getting location for bucket {Bucket}", bucketName);
         if (string.IsNullOrWhiteSpace(authInfo.AccessKeyId)) throw new ArgumentException("AccessKeyId is required.");
         if (string.IsNullOrWhiteSpace(authInfo.SecretAccessKey)) throw new ArgumentException("SecretAccessKey is required.");
-        if (string.IsNullOrWhiteSpace(authInfo.Region)) throw new ArgumentException("Region is required.");
         if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
 
-        if (!TryGetBucketRegion(authInfo, bucketName, out var region, maxAttempts: 3))
+        if (string.IsNullOrWhiteSpace(authInfo.Region))
         {
-          errormessage = "Bucket location could not be resolved with HeadBucket.";
+          _logger.LogInformation(
+            "GetBucketLocation called without a bootstrap region for bucket {Bucket}; defaulting to us-east-1.",
+            bucketName);
+        }
+
+        if (!TryGetBucketRegion(authInfo, bucketName, out var region, out var regionLookupError, maxAttempts: 3))
+        {
+          errormessage = string.IsNullOrWhiteSpace(regionLookupError)
+            ? "Bucket location could not be resolved with HeadBucket."
+            : regionLookupError;
           return false;
         }
 
@@ -636,7 +750,7 @@ namespace S3Orchestrator_ExternalLogic
       catch (AmazonS3Exception ex) when (string.Equals(ex.ErrorCode, "BucketAlreadyExists", StringComparison.OrdinalIgnoreCase))
       {
         _logger.LogWarning(ex, "Bucket {Bucket} already exists and is owned by another account.", bucketName);
-        errormessage = $"Bucket '{bucketName}' already exists.";
+        errormessage = $"Bucket '{bucketName}' is not available. S3 general purpose bucket names are globally unique, and this name is already in use by another account.";
         return false;
       }
       catch (Exception ex)
@@ -655,17 +769,30 @@ namespace S3Orchestrator_ExternalLogic
         _logger.LogInformation("Deleting bucket {Bucket}", bucketName);
         if (string.IsNullOrWhiteSpace(authInfo.AccessKeyId)) throw new ArgumentException("AccessKeyId is required.");
         if (string.IsNullOrWhiteSpace(authInfo.SecretAccessKey)) throw new ArgumentException("SecretAccessKey is required.");
-        if (string.IsNullOrWhiteSpace(authInfo.Region)) throw new ArgumentException("Region is required.");
         if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
 
-        using var s3 = CreateClient(authInfo);
-        var request = new DeleteBucketRequest
+        if (string.IsNullOrWhiteSpace(authInfo.Region))
         {
-          BucketName = bucketName
-        };
+          _logger.LogInformation(
+            "DeleteBucket called without a bootstrap region for bucket {Bucket}; defaulting to us-east-1 for discovery.",
+            bucketName);
+        }
 
+        if (!TryGetBucketRegion(authInfo, bucketName, out var resolvedRegion, out var regionLookupError, maxAttempts: 3))
+        {
+          errormessage = string.IsNullOrWhiteSpace(regionLookupError)
+            ? "Bucket location could not be resolved with HeadBucket."
+            : regionLookupError;
+          return false;
+        }
+
+        var regionScopedAuth = authInfo;
+        regionScopedAuth.Region = resolvedRegion;
+
+        using var s3 = CreateClient(regionScopedAuth);
+        var request = CreateDeleteBucketRequest(bucketName, resolvedRegion);
         Sync(s3.DeleteBucketAsync(request));
-        _logger.LogInformation("Deleted bucket {Bucket}", bucketName);
+        _logger.LogInformation("Deleted bucket {Bucket} in region {Region}", bucketName, resolvedRegion);
         return true;
       }
       catch (AmazonS3Exception ex) when (string.Equals(ex.ErrorCode, "BucketNotEmpty", StringComparison.OrdinalIgnoreCase))
@@ -954,10 +1081,11 @@ namespace S3Orchestrator_ExternalLogic
                 var successHeader = GetHeaderValue(postResp, "success");
                 var errorHeader = GetHeaderValue(postResp, "errorMessage");
                 var body = postResp.Content != null ? Sync(postResp.Content.ReadAsStringAsync()) : string.Empty;
-                var binGuid = ExtractBinGuidFromBody(body);
-
                 bool success = ParseBool(successHeader ?? string.Empty) && postResp.IsSuccessStatusCode;
-                string errorMsg = errorHeader ?? (success ? "" : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}");
+                string binGuid = success ? ExtractBinGuidFromBody(body) : string.Empty;
+                string errorMsg = success
+                  ? string.Empty
+                  : BuildFailureMessage(postResp, errorHeader, body);
 
                 attemptResult = new DownloadToRestResult { BinGuid = binGuid, Success = success, ErrorMessage = errorMsg };
               }
@@ -1021,7 +1149,219 @@ namespace S3Orchestrator_ExternalLogic
       }
     }
 
-    // ---------- NEW: ODC REST (chunked GETs) -> S3 MULTIPART ----------
+    // --- S3 -> ODC REST (chunked base64 experiment; large files) ---
+    public DownloadToRestResult DownloadFromPresignedUrlToRestBase64(
+      string presignedGetUrl,
+      string targetUrl,
+      string s3ObjectKey,
+      string bucketName,
+      string targetAuthHeaderName,
+      string targetAuthHeaderValue,
+      string targetContentType,
+      int chunkSizeBytes,
+      int timeoutSeconds)
+    {
+      var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+      HttpResponseMessage? getResp = null;
+      Stream? srcStream = null;
+      string? tempFilePath = null;
+      FileStream? tempFileStream = null;
+      try
+      {
+        if (string.IsNullOrWhiteSpace(presignedGetUrl)) throw new ArgumentException("presignedGetUrl is required.");
+        if (string.IsNullOrWhiteSpace(targetUrl)) throw new ArgumentException("targetUrl is required.");
+        if (string.IsNullOrWhiteSpace(s3ObjectKey)) throw new ArgumentException("s3ObjectKey is required.");
+        if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
+
+        _logger.LogInformation("Downloading (base64 experiment) from S3 host {SourceHost} to target host {TargetHost}", SafeHost(presignedGetUrl), SafeHost(targetUrl));
+
+        // Base64 expands payload by ~33%, so lower raw chunk size headroom.
+        const int maxChunkSize = 18_000_000;
+        if (chunkSizeBytes <= 0 || chunkSizeBytes > maxChunkSize) chunkSizeBytes = maxChunkSize;
+        if (timeoutSeconds <= 0) timeoutSeconds = 120;
+
+        var http = GetHttpClient(timeoutSeconds);
+
+        long? contentLength = TryGetContentLength(http, presignedGetUrl);
+        if (!contentLength.HasValue)
+        {
+          _logger.LogWarning("Source length unavailable via HEAD/Range for host {SourceHost}; probing GET headers", SafeHost(presignedGetUrl));
+          getResp = OpenGetResponse(http, presignedGetUrl);
+          getResp.EnsureSuccessStatusCode();
+          contentLength = getResp.Content.Headers.ContentLength;
+
+          if (!contentLength.HasValue)
+          {
+            _logger.LogWarning("Source length missing from GET headers for host {SourceHost}; buffering to temporary file", SafeHost(presignedGetUrl));
+            tempFilePath = Path.GetTempFileName();
+            using (var responseStream = getResp.Content.ReadAsStream())
+            {
+              contentLength = BufferToTempFile(responseStream, tempFilePath);
+            }
+            getResp.Dispose();
+            getResp = null;
+            tempFileStream = new FileStream(tempFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            srcStream = tempFileStream;
+          }
+          else
+          {
+            srcStream = getResp.Content.ReadAsStream();
+          }
+        }
+
+        if (!contentLength.HasValue)
+          throw new InvalidOperationException("Cannot determine source length (HEAD/Range/GET failed).");
+
+        int totalChunks = (int)((contentLength.Value + (chunkSizeBytes - 1)) / chunkSizeBytes);
+        _logger.LogInformation("Source length {ContentLength} bytes, raw chunk size {ChunkSize} bytes, total chunks {TotalChunks}", contentLength.Value, chunkSizeBytes, totalChunks);
+
+        if (srcStream == null)
+        {
+          getResp = OpenGetResponse(http, presignedGetUrl);
+          getResp.EnsureSuccessStatusCode();
+          srcStream = getResp.Content.ReadAsStream();
+        }
+
+        // Fixed content type for base64 endpoint contract.
+        var forcedContentType = "text/plain; charset=utf-8";
+        if (!string.IsNullOrWhiteSpace(targetContentType) && !targetContentType.Equals(forcedContentType, StringComparison.OrdinalIgnoreCase))
+          _logger.LogDebug("Ignoring targetContentType '{TargetContentType}' for base64 endpoint; using {ForcedContentType}", targetContentType, forcedContentType);
+
+        var targetWithKey = AppendQueryParameter(
+                              AppendQueryParameter(targetUrl, "Key", s3ObjectKey),
+                              "BucketName", bucketName);
+
+        var uploadId = Guid.NewGuid().ToString("N");
+        var buffer = ArrayPool<byte>.Shared.Rent(chunkSizeBytes);
+        try
+        {
+          long totalRead = 0;
+          int index = 0;
+
+          DownloadToRestResult finalResult = new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "" };
+
+          for (; ; index++)
+          {
+            int read = ReadFull(srcStream, buffer, 0, chunkSizeBytes);
+            if (read <= 0)
+            {
+              if (index == 0)
+              {
+                _logger.LogWarning("Source stream is empty for key {Key}", s3ObjectKey);
+                return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "Source stream is empty." };
+              }
+              break;
+            }
+
+            totalRead += read;
+            bool isLast = (index == totalChunks - 1) || (totalRead >= contentLength.Value);
+            var base64Payload = EncodeChunkToBase64(buffer, read);
+
+            _logger.LogDebug("Posting base64 chunk {ChunkIndex}/{TotalChunks} (raw bytes {BytesRead}, base64 chars {Base64Chars})", index + 1, totalChunks, read, base64Payload.Length);
+
+            DownloadToRestResult? attemptResult = null;
+
+            const int maxAttempts = 3;
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+              using var content = new StringContent(base64Payload, Encoding.UTF8, "text/plain");
+              content.Headers.ContentType = MediaTypeHeaderValue.Parse(forcedContentType);
+              content.Headers.ContentLength = Encoding.UTF8.GetByteCount(base64Payload);
+              using var postReq = new HttpRequestMessage(HttpMethod.Post, targetWithKey) { Content = content };
+              // Chunk headers for assembly (server is 0-based)
+              postReq.Headers.TryAddWithoutValidation("X-Upload-Id", uploadId);
+              postReq.Headers.TryAddWithoutValidation("X-Chunk-Index", index.ToString());
+              postReq.Headers.TryAddWithoutValidation("X-Chunk-Index-Base", "0");
+              postReq.Headers.TryAddWithoutValidation("X-Chunk-Total", totalChunks.ToString());
+              postReq.Headers.TryAddWithoutValidation("X-Last-Chunk", isLast ? "true" : "false");
+
+              if (!string.IsNullOrWhiteSpace(targetAuthHeaderName) && !string.IsNullOrWhiteSpace(targetAuthHeaderValue))
+                postReq.Headers.TryAddWithoutValidation(targetAuthHeaderName, targetAuthHeaderValue);
+
+              postReq.Headers.ExpectContinue = false;
+
+              using var postResp = http.Send(postReq, HttpCompletionOption.ResponseHeadersRead);
+
+              if (!postResp.IsSuccessStatusCode && TransientStatus.Contains(postResp.StatusCode) && attempt < maxAttempts)
+              {
+                _logger.LogWarning("Transient status {StatusCode} on base64 chunk {ChunkIndex}, attempt {Attempt}/{MaxAttempts}", postResp.StatusCode, index + 1, attempt, maxAttempts);
+                System.Threading.Thread.Sleep(200 * attempt);
+                continue;
+              }
+
+              if (isLast)
+              {
+                var successHeader = GetHeaderValue(postResp, "success");
+                var errorHeader = GetHeaderValue(postResp, "errorMessage");
+                var body = postResp.Content != null ? Sync(postResp.Content.ReadAsStringAsync()) : string.Empty;
+                bool success = ParseBool(successHeader ?? string.Empty) && postResp.IsSuccessStatusCode;
+                string binGuid = success ? ExtractBinGuidFromBody(body) : string.Empty;
+                string errorMsg = success
+                  ? string.Empty
+                  : BuildFailureMessage(postResp, errorHeader, body);
+
+                attemptResult = new DownloadToRestResult { BinGuid = binGuid, Success = success, ErrorMessage = errorMsg };
+              }
+              else
+              {
+                if (!postResp.IsSuccessStatusCode)
+                {
+                  var msg = postResp.Content != null ? Sync(postResp.Content.ReadAsStringAsync()) : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}";
+                  attemptResult = new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = msg };
+                }
+                else
+                {
+                  attemptResult = new DownloadToRestResult { BinGuid = "", Success = true, ErrorMessage = "" };
+                }
+              }
+
+              break;
+            }
+
+            if (attemptResult == null)
+            {
+              _logger.LogError("Unknown error sending base64 chunk {ChunkIndex} for key {Key}", index + 1, s3ObjectKey);
+              return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "Unknown error sending chunk." };
+            }
+
+            if (!attemptResult.Value.Success)
+            {
+              _logger.LogError("Failed sending base64 chunk {ChunkIndex} for key {Key}. Error: {Error}", index + 1, s3ObjectKey, attemptResult.Value.ErrorMessage);
+              return attemptResult.Value;
+            }
+
+            if (isLast)
+            {
+              finalResult = attemptResult.Value;
+              _logger.LogInformation("Base64 download to REST completed in {ElapsedMs} ms, BinGuid {BinGuid}", stopwatch.ElapsedMilliseconds, finalResult.BinGuid);
+              return finalResult;
+            }
+          }
+
+          _logger.LogError("Unexpected end of stream without final chunk for key {Key}", s3ObjectKey);
+          return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "Unexpected end of stream without final chunk." };
+        }
+        finally
+        {
+          ArrayPool<byte>.Shared.Return(buffer);
+        }
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed base64 download from S3 host {SourceHost} to target host {TargetHost}", SafeHost(presignedGetUrl), SafeHost(targetUrl));
+        throw;
+      }
+      finally
+      {
+        try { getResp?.Dispose(); } catch { }
+        if (tempFileStream != null) tempFileStream.Dispose();
+        if (!string.IsNullOrWhiteSpace(tempFilePath))
+        {
+          try { File.Delete(tempFilePath); } catch { }
+        }
+      }
+    }
+
     public UploadToS3Result UploadFromRestToS3Multipart(
       S3AuthInfo authInfo,
       string bucketName,
@@ -1220,7 +1560,7 @@ namespace S3Orchestrator_ExternalLogic
       }
     }
 
-    public bool RenameObject(S3AuthInfo authInfo, string bucketName, string currentKey, string newKey, out string errormessage)
+    public bool RenameMoveObject(S3AuthInfo authInfo, string bucketName, string currentKey, string newKey, out string errormessage)
     {
       errormessage = string.Empty;
       try
@@ -1261,12 +1601,12 @@ namespace S3Orchestrator_ExternalLogic
       }
     }
 
-    public bool RenameFile(S3AuthInfo authInfo, string bucketName, string currentKey, string newFileName, out string errormessage)
+    public bool RenameObject(S3AuthInfo authInfo, string bucketName, string currentKey, string newFileName, out string errormessage)
     {
       errormessage = string.Empty;
       try
       {
-        _logger.LogInformation("Renaming file in bucket {Bucket} for key {CurrentKey} to new file name {NewFileName}", bucketName, currentKey, newFileName);
+        _logger.LogInformation("Renaming object in bucket {Bucket} for key {CurrentKey} to new file name {NewFileName}", bucketName, currentKey, newFileName);
         if (string.IsNullOrWhiteSpace(currentKey)) throw new ArgumentException("currentKey is required.");
         if (string.IsNullOrWhiteSpace(newFileName)) throw new ArgumentException("newFileName is required.");
         ValidateS3Key(currentKey);
@@ -1282,17 +1622,17 @@ namespace S3Orchestrator_ExternalLogic
         }
 
         string newKey = directory + newFileName;
-        return RenameObject(authInfo, bucketName, currentKey, newKey, out errormessage);
+        return RenameMoveObject(authInfo, bucketName, currentKey, newKey, out errormessage);
       }
       catch (Exception ex)
       {
-        _logger.LogError(ex, "Failed to rename file in bucket {Bucket} for key {CurrentKey} to new file name {NewFileName}", bucketName, currentKey, newFileName);
+        _logger.LogError(ex, "Failed to rename object in bucket {Bucket} for key {CurrentKey} to new file name {NewFileName}", bucketName, currentKey, newFileName);
         errormessage = ex.Message;
         return false;
       }
     }
 
-    public bool DeleteFile(S3AuthInfo authInfo, string bucketName, string key, out string errormessage)
+    public bool DeleteObject(S3AuthInfo authInfo, string bucketName, string key, out string errormessage)
     {
       errormessage = string.Empty;
       try
@@ -1337,7 +1677,7 @@ namespace S3Orchestrator_ExternalLogic
       }
     }
 
-    public bool MoveFile(S3AuthInfo authInfo, string bucketName, string sourceKey, string targetDirectory, out string errormessage)
+    public bool MoveObject(S3AuthInfo authInfo, string bucketName, string sourceKey, string targetDirectory, out string errormessage)
     {
       errormessage = string.Empty;
       try
@@ -1357,13 +1697,214 @@ namespace S3Orchestrator_ExternalLogic
         if (string.IsNullOrEmpty(fileName)) throw new ArgumentException("Could not determine filename from sourceKey.");
 
         string newKey = targetDirectory + fileName;
-        return RenameObject(authInfo, bucketName, sourceKey, newKey, out errormessage);
+        return RenameMoveObject(authInfo, bucketName, sourceKey, newKey, out errormessage);
       }
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to move file in bucket {Bucket} from {SourceKey} to directory {TargetDirectory}", bucketName, sourceKey, targetDirectory);
         errormessage = ex.Message;
         return false;
+      }
+    }
+
+    public bool CheckPdfInS3WithQpdf(S3AuthInfo authInfo, string bucketName, string key, out string errormessage, out QpdfCheckResult checkResult)
+    {
+      bucketName ??= string.Empty;
+      key ??= string.Empty;
+      errormessage = string.Empty;
+      checkResult = new QpdfCheckResult
+      {
+        BucketName = bucketName,
+        Key = key,
+        ExitCode = -1,
+        HasWarnings = false,
+        IsLinearized = false,
+        IsEncrypted = false,
+        OutputText = string.Empty
+      };
+
+      string? workDir = null;
+      try
+      {
+        _logger.LogInformation("Checking PDF in bucket {Bucket} with key {Key} using qpdf", bucketName, key);
+        Validate(authInfo, bucketName, key, 1);
+        ValidateS3Key(key);
+
+        using var s3 = CreateClient(authInfo);
+        var metadata = GetQpdfSourceMetadata(s3, bucketName, key);
+        workDir = CreateQpdfWorkDirectory();
+        var inputPath = Path.Combine(workDir, "input.pdf");
+
+        DownloadS3ObjectToFile(s3, bucketName, key, inputPath);
+
+        var checkExec = RunQpdf(new[] { "--check", inputPath });
+        var isEncrypted = GetQpdfEncryptionStatus(inputPath);
+
+        checkResult = new QpdfCheckResult
+        {
+          BucketName = bucketName,
+          Key = key,
+          ExitCode = checkExec.ExitCode,
+          HasWarnings = checkExec.ExitCode == 3,
+          IsLinearized = ParseQpdfLinearizedStatus(checkExec.OutputText),
+          IsEncrypted = isEncrypted,
+          OutputText = checkExec.OutputText
+        };
+
+        if (checkExec.ExitCode == 0 || checkExec.ExitCode == 3)
+        {
+          _logger.LogInformation(
+            "qpdf check completed for bucket {Bucket} and key {Key} with exit code {ExitCode}",
+            bucketName,
+            key,
+            checkExec.ExitCode);
+          return true;
+        }
+
+        errormessage = BuildQpdfFailureMessage("qpdf check failed.", checkExec.ExitCode, checkExec.OutputText);
+        _logger.LogWarning("qpdf check failed for bucket {Bucket} and key {Key}: {Error}", bucketName, key, errormessage);
+        return false;
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed to check PDF in bucket {Bucket} with key {Key} using qpdf", bucketName, key);
+        errormessage = ex.Message;
+        return false;
+      }
+      finally
+      {
+        DeleteDirectoryQuietly(workDir);
+      }
+    }
+
+    public bool NormalizePdfInS3WithQpdf(S3AuthInfo authInfo, string bucketName, string key, string mode, out string errormessage, out QpdfNormalizeResult normalizeResult)
+    {
+      bucketName ??= string.Empty;
+      key ??= string.Empty;
+      mode ??= string.Empty;
+      errormessage = string.Empty;
+      normalizeResult = new QpdfNormalizeResult
+      {
+        BucketName = bucketName,
+        Key = key,
+        Mode = mode,
+        OriginalSize = 0,
+        OutputSize = 0,
+        OutputETag = string.Empty,
+        PreCheckHadWarnings = false,
+        OutputText = string.Empty
+      };
+
+      if (!TryBuildQpdfNormalizeArguments(mode, out var normalizeArgs, out var normalizedMode, out var modeError))
+      {
+        errormessage = modeError;
+        return false;
+      }
+
+      string? workDir = null;
+      try
+      {
+        _logger.LogInformation("Normalizing PDF in bucket {Bucket} with key {Key} using qpdf mode {Mode}", bucketName, key, normalizedMode);
+        Validate(authInfo, bucketName, key, 1);
+        ValidateS3Key(key);
+
+        using var s3 = CreateClient(authInfo);
+        var metadata = GetQpdfSourceMetadata(s3, bucketName, key);
+        var tagSet = GetObjectTagSet(s3, bucketName, key);
+
+        workDir = CreateQpdfWorkDirectory();
+        var inputPath = Path.Combine(workDir, "input.pdf");
+        var outputPath = Path.Combine(workDir, "output.pdf");
+
+        DownloadS3ObjectToFile(s3, bucketName, key, inputPath);
+
+        var preCheck = RunQpdf(new[] { "--check", inputPath });
+        var isEncrypted = GetQpdfEncryptionStatus(inputPath);
+
+        normalizeResult = new QpdfNormalizeResult
+        {
+          BucketName = bucketName,
+          Key = key,
+          Mode = normalizedMode,
+          OriginalSize = metadata.ContentLength,
+          OutputSize = 0,
+          OutputETag = string.Empty,
+          PreCheckHadWarnings = preCheck.ExitCode == 3,
+          OutputText = preCheck.OutputText
+        };
+
+        if (isEncrypted)
+        {
+          errormessage = "Encrypted PDFs are not supported by NormalizePdfInS3WithQpdf.";
+          return false;
+        }
+
+        if (preCheck.ExitCode != 0 && preCheck.ExitCode != 3)
+        {
+          errormessage = BuildQpdfFailureMessage("qpdf preflight check failed.", preCheck.ExitCode, preCheck.OutputText);
+          return false;
+        }
+
+        var transformArgs = normalizeArgs(inputPath, outputPath);
+        var normalizeExec = RunQpdf(transformArgs);
+        if (normalizeExec.ExitCode != 0)
+        {
+          normalizeResult.OutputText = BuildQpdfNormalizeOutputText(preCheck.OutputText, normalizeExec.OutputText, null);
+          errormessage = BuildQpdfFailureMessage("qpdf normalization failed.", normalizeExec.ExitCode, normalizeExec.OutputText);
+          return false;
+        }
+
+        if (!File.Exists(outputPath))
+          throw new InvalidOperationException("qpdf did not create an output PDF.");
+
+        var outputInfo = new FileInfo(outputPath);
+        if (outputInfo.Length <= 0)
+          throw new InvalidOperationException("qpdf produced an empty output PDF.");
+
+        var postCheck = RunQpdf(new[] { "--check", outputPath });
+        normalizeResult.OutputText = BuildQpdfNormalizeOutputText(preCheck.OutputText, normalizeExec.OutputText, postCheck.OutputText);
+        if (postCheck.ExitCode != 0)
+        {
+          errormessage = BuildQpdfFailureMessage("qpdf post-validation failed.", postCheck.ExitCode, postCheck.OutputText);
+          return false;
+        }
+
+        var putRequest = BuildNormalizedPdfPutRequest(bucketName, key, outputPath, metadata, tagSet);
+        var putResponse = Sync(s3.PutObjectAsync(putRequest));
+        var etag = putResponse.ETag ?? string.Empty;
+        if (!string.IsNullOrEmpty(etag)) etag = etag.Trim('"');
+
+        normalizeResult = new QpdfNormalizeResult
+        {
+          BucketName = bucketName,
+          Key = key,
+          Mode = normalizedMode,
+          OriginalSize = metadata.ContentLength,
+          OutputSize = outputInfo.Length,
+          OutputETag = etag,
+          PreCheckHadWarnings = preCheck.ExitCode == 3,
+          OutputText = BuildQpdfNormalizeOutputText(preCheck.OutputText, normalizeExec.OutputText, postCheck.OutputText)
+        };
+
+        _logger.LogInformation(
+          "Normalized PDF in bucket {Bucket} with key {Key} using qpdf mode {Mode}. Size {OriginalSize} -> {OutputSize}",
+          bucketName,
+          key,
+          normalizedMode,
+          metadata.ContentLength,
+          outputInfo.Length);
+
+        return true;
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed to normalize PDF in bucket {Bucket} with key {Key} using qpdf mode {Mode}", bucketName, key, mode);
+        errormessage = ex.Message;
+        return false;
+      }
+      finally
+      {
+        DeleteDirectoryQuietly(workDir);
       }
     }
 
@@ -1580,6 +2121,25 @@ namespace S3Orchestrator_ExternalLogic
       return total;
     }
 
+    private static string EncodeChunkToBase64(byte[] buffer, int count)
+    {
+      if (count <= 0) return string.Empty;
+
+      int charCount = ((count + 2) / 3) * 4;
+      var charBuffer = ArrayPool<char>.Shared.Rent(charCount);
+      try
+      {
+        if (!Convert.TryToBase64Chars(buffer.AsSpan(0, count), charBuffer.AsSpan(0, charCount), out int charsWritten))
+          throw new InvalidOperationException("Failed to base64 encode chunk.");
+
+        return new string(charBuffer, 0, charsWritten);
+      }
+      finally
+      {
+        ArrayPool<char>.Shared.Return(charBuffer, clearArray: true);
+      }
+    }
+
     private static string? GetHeaderValue(HttpResponseMessage resp, string headerName)
     {
       if (resp.Headers.TryGetValues(headerName, out var values))
@@ -1595,6 +2155,386 @@ namespace S3Orchestrator_ExternalLogic
       return value.Equals("true", StringComparison.OrdinalIgnoreCase)
           || value.Equals("1")
           || value.Equals("yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryBuildQpdfNormalizeArguments(
+      string mode,
+      out Func<string, string, string[]> argumentBuilder,
+      out string normalizedMode,
+      out string errorMessage)
+    {
+      argumentBuilder = (_, _) => Array.Empty<string>();
+      normalizedMode = string.Empty;
+      errorMessage = string.Empty;
+
+      if (string.IsNullOrWhiteSpace(mode))
+      {
+        errorMessage = "mode is required.";
+        return false;
+      }
+
+      switch (mode.Trim())
+      {
+        case "Linearize":
+          normalizedMode = "Linearize";
+          argumentBuilder = (input, output) => new[] { "--warning-exit-0", "--linearize", input, output };
+          return true;
+        case "FlattenAnnotationsAll":
+          normalizedMode = "FlattenAnnotationsAll";
+          argumentBuilder = (input, output) => new[] { "--warning-exit-0", "--flatten-annotations=all", input, output };
+          return true;
+        case "FlattenAnnotationsPrint":
+          normalizedMode = "FlattenAnnotationsPrint";
+          argumentBuilder = (input, output) => new[] { "--warning-exit-0", "--flatten-annotations=print", input, output };
+          return true;
+        case "FlattenAnnotationsScreen":
+          normalizedMode = "FlattenAnnotationsScreen";
+          argumentBuilder = (input, output) => new[] { "--warning-exit-0", "--flatten-annotations=screen", input, output };
+          return true;
+        default:
+          errorMessage = "mode must be one of: Linearize, FlattenAnnotationsAll, FlattenAnnotationsPrint, FlattenAnnotationsScreen.";
+          return false;
+      }
+    }
+
+    private static string CreateQpdfWorkDirectory()
+    {
+      var workDir = Path.Combine(Path.GetTempPath(), "s3orchestrator-qpdf", "work", Guid.NewGuid().ToString("N"));
+      Directory.CreateDirectory(workDir);
+      return workDir;
+    }
+
+    private static void DeleteDirectoryQuietly(string? path)
+    {
+      if (string.IsNullOrWhiteSpace(path)) return;
+      try
+      {
+        if (Directory.Exists(path))
+          Directory.Delete(path, recursive: true);
+      }
+      catch { }
+    }
+
+    private static GetObjectMetadataResponse GetQpdfSourceMetadata(IAmazonS3 s3, string bucketName, string key)
+    {
+      var metadata = Sync(s3.GetObjectMetadataAsync(new GetObjectMetadataRequest
+      {
+        BucketName = bucketName,
+        Key = key
+      }));
+
+      if (metadata.ContentLength <= 0)
+        throw new InvalidOperationException("Source PDF is empty.");
+
+      if (metadata.ContentLength > MaxQpdfSourceBytes)
+        throw new InvalidOperationException($"Source PDF exceeds the supported {MaxQpdfSourceBytes} byte limit for qpdf normalization.");
+
+      return metadata;
+    }
+
+    private static List<Tag> GetObjectTagSet(IAmazonS3 s3, string bucketName, string key)
+    {
+      try
+      {
+        var response = Sync(s3.GetObjectTaggingAsync(new GetObjectTaggingRequest
+        {
+          BucketName = bucketName,
+          Key = key
+        }));
+
+        if (response.Tagging == null || response.Tagging.Count == 0)
+          return new List<Tag>();
+
+        return response.Tagging
+          .Select(tag => new Tag { Key = tag.Key, Value = tag.Value })
+          .ToList();
+      }
+      catch (AmazonS3Exception ex) when (
+        string.Equals(ex.ErrorCode, "NoSuchTagSet", StringComparison.OrdinalIgnoreCase) ||
+        ex.StatusCode == HttpStatusCode.NotFound)
+      {
+        return new List<Tag>();
+      }
+    }
+
+    private static void DownloadS3ObjectToFile(IAmazonS3 s3, string bucketName, string key, string destinationPath)
+    {
+      using var response = Sync(s3.GetObjectAsync(new GetObjectRequest
+      {
+        BucketName = bucketName,
+        Key = key
+      }));
+
+      if (response.ResponseStream == null)
+        throw new InvalidOperationException("S3 returned no response stream for the source PDF.");
+
+      BufferToTempFile(response.ResponseStream, destinationPath);
+    }
+
+    private PutObjectRequest BuildNormalizedPdfPutRequest(
+      string bucketName,
+      string key,
+      string filePath,
+      GetObjectMetadataResponse metadata,
+      List<Tag> tagSet)
+    {
+      var request = new PutObjectRequest
+      {
+        BucketName = bucketName,
+        Key = key,
+        FilePath = filePath
+      };
+
+      request.AutoCloseStream = true;
+      request.AutoResetStreamPosition = true;
+
+      if (!string.IsNullOrWhiteSpace(metadata.ContentType))
+        request.ContentType = metadata.ContentType;
+      if (!string.IsNullOrWhiteSpace(metadata.CacheControl))
+        request.Headers.CacheControl = metadata.CacheControl;
+      if (!string.IsNullOrWhiteSpace(metadata.ContentDisposition))
+        request.Headers.ContentDisposition = metadata.ContentDisposition;
+      if (!string.IsNullOrWhiteSpace(metadata.ContentEncoding))
+        request.Headers.ContentEncoding = metadata.ContentEncoding;
+      if (!string.IsNullOrWhiteSpace(metadata.ContentLanguage))
+        request.Headers["Content-Language"] = metadata.ContentLanguage;
+      if (!string.IsNullOrWhiteSpace(metadata.ExpiresString) &&
+          DateTime.TryParse(metadata.ExpiresString, out var expires))
+        request.Headers.Expires = expires;
+      if (!string.IsNullOrWhiteSpace(metadata.WebsiteRedirectLocation))
+        request.WebsiteRedirectLocation = metadata.WebsiteRedirectLocation;
+
+      foreach (var metaKey in metadata.Metadata.Keys)
+      {
+        request.Metadata[metaKey] = metadata.Metadata[metaKey];
+      }
+
+      if (metadata.StorageClass != null)
+        request.StorageClass = metadata.StorageClass;
+
+      request.ServerSideEncryptionMethod = metadata.ServerSideEncryptionMethod;
+      if (!string.IsNullOrWhiteSpace(metadata.ServerSideEncryptionKeyManagementServiceKeyId))
+        request.ServerSideEncryptionKeyManagementServiceKeyId = metadata.ServerSideEncryptionKeyManagementServiceKeyId;
+      request.BucketKeyEnabled = metadata.BucketKeyEnabled;
+
+      if (tagSet.Count > 0)
+        request.TagSet = tagSet;
+
+      return request;
+    }
+
+    private QpdfExecutionResult RunQpdf(IReadOnlyList<string> arguments)
+    {
+      var executablePath = EnsureQpdfExecutablePath();
+      var binDir = Path.GetDirectoryName(executablePath) ?? throw new InvalidOperationException("Cannot resolve qpdf bin directory.");
+      var toolRoot = Path.GetDirectoryName(binDir) ?? throw new InvalidOperationException("Cannot resolve qpdf tool directory.");
+      var libDir = Path.Combine(toolRoot, "lib");
+
+      var startInfo = new ProcessStartInfo(executablePath)
+      {
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        UseShellExecute = false,
+        CreateNoWindow = true,
+        WorkingDirectory = toolRoot
+      };
+
+      foreach (var argument in arguments)
+        startInfo.ArgumentList.Add(argument);
+
+      startInfo.Environment["LD_LIBRARY_PATH"] = libDir;
+
+      using var process = new Process { StartInfo = startInfo };
+      process.Start();
+      var stdout = process.StandardOutput.ReadToEnd();
+      var stderr = process.StandardError.ReadToEnd();
+      process.WaitForExit();
+
+      return new QpdfExecutionResult
+      {
+        ExitCode = process.ExitCode,
+        OutputText = CombineOutputTexts(stdout, stderr)
+      };
+    }
+
+    private string EnsureQpdfExecutablePath()
+    {
+      EnsureQpdfRuntimeSupported();
+
+      var bundlePath = Path.Combine(AppContext.BaseDirectory, "resources", "qpdf", QpdfBundleFileName);
+      if (!File.Exists(bundlePath))
+        throw new FileNotFoundException("The bundled qpdf runtime zip was not found in the published external library output.", bundlePath);
+
+      var toolRoot = Path.Combine(Path.GetTempPath(), "s3orchestrator-qpdf", "tool", $"qpdf-{QpdfVersion}");
+      var executablePath = Path.Combine(toolRoot, "bin", "qpdf");
+      if (File.Exists(executablePath))
+        return executablePath;
+
+      lock (QpdfExtractLock)
+      {
+        if (File.Exists(executablePath))
+          return executablePath;
+
+        DeleteDirectoryQuietly(toolRoot);
+        Directory.CreateDirectory(toolRoot);
+        ZipFile.ExtractToDirectory(bundlePath, toolRoot, overwriteFiles: true);
+        EnsureQpdfSharedLibraryAlias(toolRoot);
+        SetQpdfExecutableBits(toolRoot);
+
+        if (!File.Exists(executablePath))
+          throw new FileNotFoundException("qpdf executable was not found after extracting the runtime bundle.", executablePath);
+      }
+
+      return executablePath;
+    }
+
+    private static void EnsureQpdfRuntimeSupported()
+    {
+      if (!OperatingSystem.IsLinux())
+        throw new PlatformNotSupportedException("qpdf normalization is only supported on Linux ODC external-logic runtimes.");
+
+      if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+        throw new PlatformNotSupportedException("qpdf normalization is only supported on Linux x64 ODC external-logic runtimes.");
+    }
+
+    private static void EnsureQpdfSharedLibraryAlias(string toolRoot)
+    {
+      var libDir = Path.Combine(toolRoot, "lib");
+      var targetPath = Path.Combine(libDir, "libqpdf.so.30.3.0");
+      var aliasPath = Path.Combine(libDir, "libqpdf.so.30");
+
+      if (!File.Exists(targetPath))
+        throw new FileNotFoundException("The qpdf shared library target was not found after extraction.", targetPath);
+
+      if (!File.Exists(aliasPath) || new FileInfo(aliasPath).Length < 1024)
+      {
+        try { File.Delete(aliasPath); } catch { }
+        File.Copy(targetPath, aliasPath, overwrite: true);
+      }
+    }
+
+    private static void SetQpdfExecutableBits(string toolRoot)
+    {
+      if (!OperatingSystem.IsLinux()) return;
+
+      var binDir = Path.Combine(toolRoot, "bin");
+      if (!Directory.Exists(binDir)) return;
+
+      foreach (var file in Directory.EnumerateFiles(binDir))
+      {
+        File.SetUnixFileMode(
+          file,
+          UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+          UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+          UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+      }
+    }
+
+    private bool GetQpdfEncryptionStatus(string inputPath)
+    {
+      var result = RunQpdf(new[] { "--is-encrypted", inputPath });
+      return result.ExitCode switch
+      {
+        0 => true,
+        2 => false,
+        _ => throw new InvalidOperationException(BuildQpdfFailureMessage("qpdf encryption check failed.", result.ExitCode, result.OutputText))
+      };
+    }
+
+    private static bool ParseQpdfLinearizedStatus(string outputText)
+    {
+      if (string.IsNullOrWhiteSpace(outputText)) return false;
+
+      var normalized = outputText.ToLowerInvariant();
+      if (normalized.Contains("file is not linearized")) return false;
+      return normalized.Contains("file is linearized");
+    }
+
+    private static string CombineOutputTexts(params string[] outputs)
+    {
+      return string.Join(
+        Environment.NewLine + Environment.NewLine,
+        outputs.Where(output => !string.IsNullOrWhiteSpace(output)).Select(output => output.Trim()));
+    }
+
+    private static string BuildQpdfNormalizeOutputText(string? preCheckOutput, string? normalizeOutput, string? postCheckOutput)
+    {
+      var preCheckText = TrimOutputText(preCheckOutput);
+      var normalizeText = TrimOutputText(normalizeOutput);
+      var postCheckText = TrimOutputText(postCheckOutput);
+
+      if (!string.IsNullOrEmpty(preCheckText) &&
+          !string.IsNullOrEmpty(postCheckText) &&
+          AreEquivalentQpdfCheckOutputs(preCheckText, postCheckText))
+      {
+        preCheckText = string.Empty;
+      }
+
+      var sections = new List<(string Label, string Text)>();
+      if (!string.IsNullOrEmpty(preCheckText)) sections.Add(("Preflight check", preCheckText));
+      if (!string.IsNullOrEmpty(normalizeText)) sections.Add(("Normalization", normalizeText));
+      if (!string.IsNullOrEmpty(postCheckText)) sections.Add(("Post-validation", postCheckText));
+
+      return sections.Count switch
+      {
+        0 => string.Empty,
+        1 => sections[0].Text,
+        _ => string.Join(
+          Environment.NewLine + Environment.NewLine,
+          sections.Select(section => $"{section.Label}:{Environment.NewLine}{section.Text}"))
+      };
+    }
+
+    private static bool AreEquivalentQpdfCheckOutputs(string left, string right)
+    {
+      return string.Equals(
+        NormalizeQpdfCheckOutputForComparison(left),
+        NormalizeQpdfCheckOutputForComparison(right),
+        StringComparison.Ordinal);
+    }
+
+    private static string NormalizeQpdfCheckOutputForComparison(string output)
+    {
+      return string.Join(
+        "\n",
+        output
+          .Replace("\r\n", "\n", StringComparison.Ordinal)
+          .Split('\n')
+          .Select(line => line.Trim())
+          .Where(line =>
+            !string.IsNullOrWhiteSpace(line) &&
+            !line.StartsWith("checking ", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static string TrimOutputText(string? output)
+    {
+      return string.IsNullOrWhiteSpace(output) ? string.Empty : output.Trim();
+    }
+
+    private static string BuildQpdfFailureMessage(string prefix, int exitCode, string outputText)
+    {
+      var trimmedOutput = outputText?.Trim() ?? string.Empty;
+      if (trimmedOutput.Length > 4096)
+        trimmedOutput = trimmedOutput.Substring(0, 4096) + "...";
+
+      return string.IsNullOrWhiteSpace(trimmedOutput)
+        ? $"{prefix} Exit code: {exitCode}."
+        : $"{prefix} Exit code: {exitCode}. Output: {trimmedOutput}";
+    }
+
+    private static string BuildFailureMessage(HttpResponseMessage response, string? errorHeader, string body)
+    {
+      if (!string.IsNullOrWhiteSpace(errorHeader)) return errorHeader.Trim();
+
+      var status = $"HTTP {(int)response.StatusCode} {response.ReasonPhrase}";
+      var trimmedBody = body?.Trim();
+      if (string.IsNullOrWhiteSpace(trimmedBody)) return status;
+
+      const int maxBodyLength = 1024;
+      if (trimmedBody.Length > maxBodyLength)
+        trimmedBody = trimmedBody.Substring(0, maxBodyLength) + "...";
+
+      return $"{status}. Response body: {trimmedBody}";
     }
 
     private static string ExtractBinGuidFromBody(string body)
@@ -1644,13 +2584,24 @@ namespace S3Orchestrator_ExternalLogic
 
     private bool TryGetBucketRegion(S3AuthInfo authInfo, string bucketName, out string region, int maxAttempts = 1)
     {
+      return TryGetBucketRegion(authInfo, bucketName, out region, out _, maxAttempts);
+    }
+
+    private bool TryGetBucketRegion(S3AuthInfo authInfo, string bucketName, out string region, out string lookupError, int maxAttempts = 1)
+    {
       using var s3 = CreateClient(authInfo);
-      return TryGetBucketRegion(s3, bucketName, out region, maxAttempts);
+      return TryGetBucketRegion(s3, bucketName, out region, out lookupError, maxAttempts);
     }
 
     private bool TryGetBucketRegion(IAmazonS3 s3, string bucketName, out string region, int maxAttempts = 1)
     {
+      return TryGetBucketRegion(s3, bucketName, out region, out _, maxAttempts);
+    }
+
+    private bool TryGetBucketRegion(IAmazonS3 s3, string bucketName, out string region, out string lookupError, int maxAttempts = 1)
+    {
       region = string.Empty;
+      lookupError = string.Empty;
       if (maxAttempts <= 0) maxAttempts = 1;
 
       for (var attempt = 1; attempt <= maxAttempts; attempt++)
@@ -1663,6 +2614,35 @@ namespace S3Orchestrator_ExternalLogic
           }));
           region = NormalizeRegionName(response.BucketRegion);
           return true;
+        }
+        catch (AmazonS3Exception lookupEx)
+        {
+          var regionFromException = ExtractBucketRegionFromException(lookupEx);
+          if (!string.IsNullOrWhiteSpace(regionFromException))
+          {
+            region = regionFromException;
+            _logger.LogInformation(
+              "Resolved region {Region} for bucket {Bucket} from HeadBucket exception path. Status code: {StatusCode}.",
+              region,
+              bucketName,
+              (int)lookupEx.StatusCode);
+            return true;
+          }
+
+          if (attempt >= maxAttempts)
+          {
+            lookupError = BuildBucketRegionLookupErrorMessage(bucketName, lookupEx);
+            _logger.LogWarning(lookupEx, "Failed to resolve region for bucket {Bucket}", bucketName);
+            return false;
+          }
+
+          _logger.LogWarning(
+            lookupEx,
+            "Attempt {Attempt} of {MaxAttempts} failed to resolve region for bucket {Bucket}; retrying.",
+            attempt,
+            maxAttempts,
+            bucketName);
+          System.Threading.Thread.Sleep(200 * attempt);
         }
         catch (Exception lookupEx)
         {
@@ -1683,6 +2663,45 @@ namespace S3Orchestrator_ExternalLogic
       }
 
       return false;
+    }
+
+    private static DeleteBucketRequest CreateDeleteBucketRequest(string bucketName, string region)
+    {
+      return new DeleteBucketRequest
+      {
+        BucketName = bucketName,
+        BucketRegion = S3Region.FindValue(NormalizeRegionName(region))
+      };
+    }
+
+    private static string ExtractBucketRegionFromException(AmazonS3Exception? exception)
+    {
+      if (exception == null) return string.Empty;
+
+      var rawRegion = AmazonS3ExceptionRegionProperty?.GetValue(exception) as string;
+      if (string.IsNullOrWhiteSpace(rawRegion))
+      {
+        rawRegion = AmazonS3ExceptionRegionField?.GetValue(exception) as string;
+      }
+
+      if (string.IsNullOrWhiteSpace(rawRegion)) return string.Empty;
+      return NormalizeRegionName(rawRegion);
+    }
+
+    private static string BuildBucketRegionLookupErrorMessage(string bucketName, AmazonS3Exception? exception)
+    {
+      if (exception == null)
+      {
+        return string.Empty;
+      }
+
+      if (exception.StatusCode == HttpStatusCode.NotFound
+          || string.Equals(exception.ErrorCode, "NoSuchBucket", StringComparison.OrdinalIgnoreCase))
+      {
+        return $"Bucket '{bucketName}' does not exist.";
+      }
+
+      return string.Empty;
     }
 
     private static AmazonS3Client CreateClient(S3AuthInfo auth)
