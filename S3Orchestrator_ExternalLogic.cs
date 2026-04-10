@@ -313,15 +313,15 @@ namespace S3Orchestrator_ExternalLogic
       [OSParameter(Description = "Timeout per request in seconds (default 120)")] int timeoutSeconds);
 
     [OSAction(Description = "Rename an object in S3 by copying to a new key and deleting the old one", ReturnName = "success")]
-    bool RenameMoveObject(
+    bool RenameObject(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
       [OSParameter(Description = "Current object key")] string currentKey,
       [OSParameter(Description = "New object key")] string newKey,
       [OSParameter(Description = "Error message when success is false")] out string errormessage);
 
-    [OSAction(Description = "Rename an object in S3 (change filename, keep directory)", ReturnName = "success")]
-    bool RenameObject(
+    [OSAction(Description = "Rename a file in S3 (change filename, keep directory)", ReturnName = "success")]
+    bool RenameFile(
       [OSParameter(Description = "Auth info")] S3AuthInfo authInfo,
       [OSParameter(Description = "Bucket name")] string bucketName,
       [OSParameter(Description = "Current object key")] string currentKey,
@@ -1560,7 +1560,41 @@ namespace S3Orchestrator_ExternalLogic
       }
     }
 
-    public bool RenameMoveObject(S3AuthInfo authInfo, string bucketName, string currentKey, string newKey, out string errormessage)
+    public bool RenameObject(S3AuthInfo authInfo, string bucketName, string currentKey, string newKey, out string errormessage)
+    {
+      return RenameObjectCore(authInfo, bucketName, currentKey, newKey, out errormessage);
+    }
+
+    public bool RenameFile(S3AuthInfo authInfo, string bucketName, string currentKey, string newFileName, out string errormessage)
+    {
+      errormessage = string.Empty;
+      try
+      {
+        _logger.LogInformation("Renaming object in bucket {Bucket} for key {CurrentKey} to new file name {NewFileName}", bucketName, currentKey, newFileName);
+        if (string.IsNullOrWhiteSpace(currentKey)) throw new ArgumentException("currentKey is required.");
+        if (string.IsNullOrWhiteSpace(newFileName)) throw new ArgumentException("newFileName is required.");
+        ValidateS3Key(currentKey);
+        if (newFileName.Contains("/") || newFileName.Contains("\\")) throw new ArgumentException("newFileName cannot contain path separators.");
+
+        string directory = "";
+        int lastSlash = currentKey.LastIndexOf('/');
+        if (lastSlash >= 0)
+        {
+          directory = currentKey.Substring(0, lastSlash + 1);
+        }
+
+        string newKey = directory + newFileName;
+        return RenameObjectCore(authInfo, bucketName, currentKey, newKey, out errormessage);
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed to rename object in bucket {Bucket} for key {CurrentKey} to new file name {NewFileName}", bucketName, currentKey, newFileName);
+        errormessage = ex.Message;
+        return false;
+      }
+    }
+
+    private bool RenameObjectCore(S3AuthInfo authInfo, string bucketName, string currentKey, string newKey, out string errormessage)
     {
       errormessage = string.Empty;
       try
@@ -1596,37 +1630,6 @@ namespace S3Orchestrator_ExternalLogic
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to rename object in bucket {Bucket} from {CurrentKey} to {NewKey}", bucketName, currentKey, newKey);
-        errormessage = ex.Message;
-        return false;
-      }
-    }
-
-    public bool RenameObject(S3AuthInfo authInfo, string bucketName, string currentKey, string newFileName, out string errormessage)
-    {
-      errormessage = string.Empty;
-      try
-      {
-        _logger.LogInformation("Renaming object in bucket {Bucket} for key {CurrentKey} to new file name {NewFileName}", bucketName, currentKey, newFileName);
-        if (string.IsNullOrWhiteSpace(currentKey)) throw new ArgumentException("currentKey is required.");
-        if (string.IsNullOrWhiteSpace(newFileName)) throw new ArgumentException("newFileName is required.");
-        ValidateS3Key(currentKey);
-        // newFileName is not a full key yet, but we should validate it's not empty/weird
-        if (newFileName.Contains("/") || newFileName.Contains("\\")) throw new ArgumentException("newFileName cannot contain path separators.");
-
-        // Extract directory from currentKey
-        string directory = "";
-        int lastSlash = currentKey.LastIndexOf('/');
-        if (lastSlash >= 0)
-        {
-          directory = currentKey.Substring(0, lastSlash + 1);
-        }
-
-        string newKey = directory + newFileName;
-        return RenameMoveObject(authInfo, bucketName, currentKey, newKey, out errormessage);
-      }
-      catch (Exception ex)
-      {
-        _logger.LogError(ex, "Failed to rename object in bucket {Bucket} for key {CurrentKey} to new file name {NewFileName}", bucketName, currentKey, newFileName);
         errormessage = ex.Message;
         return false;
       }
@@ -1697,7 +1700,7 @@ namespace S3Orchestrator_ExternalLogic
         if (string.IsNullOrEmpty(fileName)) throw new ArgumentException("Could not determine filename from sourceKey.");
 
         string newKey = targetDirectory + fileName;
-        return RenameMoveObject(authInfo, bucketName, sourceKey, newKey, out errormessage);
+        return RenameObjectCore(authInfo, bucketName, sourceKey, newKey, out errormessage);
       }
       catch (Exception ex)
       {
