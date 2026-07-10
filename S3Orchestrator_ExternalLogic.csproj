@@ -17,13 +17,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="resources/qpdf/qpdf-12.3.0-bin-linux-x86_64.zip">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
-    </Content>
-  </ItemGroup>
-
-  <ItemGroup>
     <Compile Remove="Version1_06.cs" />
   </ItemGroup>
 
